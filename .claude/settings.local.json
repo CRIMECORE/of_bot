@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(Get-Process *)",
+      "PowerShell(Stop-Process *)",
+      "Bash(start *)",
+      "Bash(python *)",
+      "Bash(python main.py)",
+      "Bash(echo \"bot PID: $!\")",
+      "Bash(echo \"PID: $!\")",
+      "PowerShell(taskkill *)",
+      "Bash(echo \"Started PID: $!\")"
+    ]
+  }
+}

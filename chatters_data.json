@@ -1,0 +1,18 @@
+{
+  "chatters": [
+    {
+      "name": "gofyaa gg",
+      "start_hour": 17,
+      "end_hour": 1,
+      "emoji": "🌙",
+      "user_id": 168106
+    },
+    {
+      "name": "АяНами рей",
+      "start_hour": 1,
+      "end_hour": 17,
+      "emoji": "🌅",
+      "user_id": 46038
+    }
+  ]
+}

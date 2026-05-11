@@ -1,0 +1,4 @@
+2026-05-12 05:47:25,733 - __main__ - INFO - Bot started — daily report 13:00 MSK, weekly analyze Sun 13:00 MSK
+2026-05-12 05:47:27,603 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8600071321:AAHoE2c4A8lrGCm-uS9J0QFYw46PquT8cbw/getMe "HTTP/1.1 200 OK"
+2026-05-12 05:47:27,604 - telegram.ext.Application - INFO - Application started
+2026-05-12 05:47:27,792 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8600071321:AAHoE2c4A8lrGCm-uS9J0QFYw46PquT8cbw/deleteWebhook "HTTP/1.1 200 OK"
