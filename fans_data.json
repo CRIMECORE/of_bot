@@ -1021,7 +1021,9 @@
     ],
     "purchase_interval_avg": 6.0,
     "subscription_expires": null,
-    "last_purchase_date": "2026-04-14T15:07:17"
+    "last_purchase_date": "2026-04-14T15:07:17",
+    "last_reply_date": "2026-05-12",
+    "daily_message_count": 1
   },
   "506198209": {
     "id": "506198209",
@@ -1387,7 +1389,9 @@
     ],
     "purchase_interval_avg": 3.0,
     "subscription_expires": null,
-    "last_purchase_date": "2026-04-01T18:02:15"
+    "last_purchase_date": "2026-04-01T18:02:15",
+    "last_reply_date": "2026-05-12",
+    "daily_message_count": 1
   },
   "5672748": {
     "id": "5672748",
@@ -1542,7 +1546,9 @@
     ],
     "purchase_interval_avg": 17.1,
     "subscription_expires": "2025-05-15T00:51:55",
-    "last_purchase_date": "2026-04-17T04:52:12"
+    "last_purchase_date": "2026-04-17T04:52:12",
+    "last_reply_date": "2026-05-12",
+    "daily_message_count": 1
   },
   "73314793": {
     "id": "73314793",
@@ -1943,5 +1949,8 @@
       "days_silent": null,
       "days_to_birthday": null
     }
+  },
+  "123": {
+    "last_message_date": "2026-05-12T17:48:36.651366"
   }
 }

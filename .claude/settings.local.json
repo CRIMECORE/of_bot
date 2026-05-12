@@ -9,7 +9,16 @@
       "Bash(echo \"bot PID: $!\")",
       "Bash(echo \"PID: $!\")",
       "PowerShell(taskkill *)",
-      "Bash(echo \"Started PID: $!\")"
+      "Bash(echo \"Started PID: $!\")",
+      "Bash(pip install *)",
+      "Bash(curl *)",
+      "Bash(Get-Content *)",
+      "Bash(kill 1429 *)",
+      "Bash(pkill -f \"python main.py\")",
+      "Bash(kill -9 94 93 91)",
+      "Bash(awk '{print $1}')",
+      "Bash(xargs -r kill -9)",
+      "Bash(taskkill //F //PID 306)"
     ]
   }
 }
