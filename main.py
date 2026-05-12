@@ -4467,15 +4467,9 @@ async def run() -> None:
     await web.TCPSite(runner, "0.0.0.0", 8080).start()
     logger.info("Webhook server listening on 0.0.0.0:8080")
 
-    # Prevent start_polling() from deleting the Telegram webhook settings
-    async def _noop_delete_webhook(*args, **kwargs):
-        logger.info("delete_webhook suppressed — Telegram webhook preserved")
-        return True
-    app.bot.delete_webhook = _noop_delete_webhook
-
     async with app:
         await app.start()
-        await app.updater.start_polling()
+        await app.updater.start_polling(drop_pending_updates=False, allowed_updates=Update.ALL_TYPES)
         asyncio.create_task(scheduler_loop(app))
         asyncio.create_task(_poll_unanswered_loop(app))
         await asyncio.Event().wait()
