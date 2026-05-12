@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import random
+import sys
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -3733,6 +3734,8 @@ _unanswered: dict[str, datetime] = {}
 # fan_id → already alerted for this unanswered stretch (cleared on reply)
 _alerted_unanswered: set[str] = set()
 
+_wh_events_total: int = 0   # events received since start
+
 _HOT_WORDS = frozenset({
     "how much", "price", "cost", "buy", "want", "purchase",
     "how can i", "can i get",
@@ -3958,6 +3961,9 @@ async def webhook_handler(request: web.Request) -> web.Response:
         payload = json.loads(raw)
     except Exception:
         return web.Response(status=400, text="Bad JSON")
+
+    global _wh_events_total
+    _wh_events_total += 1
 
     app = request.app["tg_app"]
     asyncio.create_task(_process_webhook(app, payload))
@@ -4299,6 +4305,61 @@ async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(" ".join(lines))
 
 
+async def cmd_webhook_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    import aiohttp as _aiohttp
+    lines: list[str] = ["<b>Webhook Status</b>"]
+
+    # 1. WEBHOOK_SECRET
+    secret = os.getenv("WEBHOOK_SECRET", "")
+    if secret and secret != "СЮДА_ВСТАВИШЬ_СЕКРЕТ":
+        lines.append("🔑 WEBHOOK_SECRET: задан ✅")
+    else:
+        lines.append("🔑 WEBHOOK_SECRET: не задан ⚠️")
+
+    # 2. HTTP connectivity + 3. test request
+    url = "http://localhost:8080/webhook"
+    test_payload = json.dumps({"event": "status_check", "data": {}}).encode()
+    try:
+        async with _aiohttp.ClientSession() as session:
+            async with session.post(
+                url,
+                data=test_payload,
+                headers={"Content-Type": "application/json"},
+                timeout=_aiohttp.ClientTimeout(total=5),
+            ) as resp:
+                status = resp.status
+        lines.append("🌐 HTTP сервер 8080: отвечает ✅")
+        if status == 200:
+            lines.append(f"📨 Тест /webhook: {status} OK ✅")
+        elif status == 401:
+            lines.append(f"📨 Тест /webhook: {status} (секрет настроен — подпись не передана) ⚠️")
+        else:
+            lines.append(f"📨 Тест /webhook: {status} ⚠️")
+    except _aiohttp.ClientConnectorError:
+        lines.append("🌐 HTTP сервер 8080: не отвечает ❌")
+        lines.append("📨 Тест /webhook: недоступен ❌")
+    except Exception as e:
+        lines.append(f"🌐 HTTP сервер 8080: ошибка — {e} ❌")
+        lines.append("📨 Тест /webhook: недоступен ❌")
+
+    # 4. Last 5 webhook-related log lines
+    try:
+        log_lines = LOG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
+        wh_lines = [l for l in log_lines if "webhook" in l.lower() or "Webhook" in l][-5:]
+        if wh_lines:
+            formatted = "\n".join(f"  {l}" for l in wh_lines)
+            lines.append(f"\n📋 Последние строки лога (webhook):\n<pre>{_html.escape(formatted)}</pre>")
+        else:
+            lines.append("\n📋 Лог: webhook-строк не найдено")
+    except Exception as e:
+        lines.append(f"\n📋 Лог: не удалось прочитать — {e}")
+
+    # 5. Events counter
+    lines.append(f"\n📊 Webhook событий с запуска: <b>{_wh_events_total}</b>")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
 async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = await update.message.reply_text("⏳ Получаю список аккаунтов...")
 
@@ -4356,6 +4417,7 @@ async def run() -> None:
     app.add_handler(CommandHandler("chatter_report_week",  cmd_chatter_report_week))
     app.add_handler(CommandHandler("chatter_edit",         cmd_chatter_edit))
     app.add_handler(CommandHandler("ping",                 cmd_ping))
+    app.add_handler(CommandHandler("webhook_status",       cmd_webhook_status))
     app.add_handler(CommandHandler("nick",                 cmd_nick))
     app.add_handler(CommandHandler("block",                cmd_block))
     app.add_handler(CommandHandler("accounts",             cmd_accounts))
@@ -4405,6 +4467,12 @@ async def run() -> None:
     await web.TCPSite(runner, "0.0.0.0", 8080).start()
     logger.info("Webhook server listening on 0.0.0.0:8080")
 
+    # Prevent start_polling() from deleting the Telegram webhook settings
+    async def _noop_delete_webhook(*args, **kwargs):
+        logger.info("delete_webhook suppressed — Telegram webhook preserved")
+        return True
+    app.bot.delete_webhook = _noop_delete_webhook
+
     async with app:
         await app.start()
         await app.updater.start_polling()
@@ -4413,5 +4481,30 @@ async def run() -> None:
         await asyncio.Event().wait()
 
 
+_PID_FILE = "/tmp/ofbot.pid"
+
+
+def _acquire_pid_lock() -> None:
+    if os.path.exists(_PID_FILE):
+        try:
+            with open(_PID_FILE) as f:
+                pid = int(f.read().strip())
+            os.kill(pid, 0)  # raises if process is gone
+            print(f"Bot already running (PID {pid}), exiting.", flush=True)
+            sys.exit(0)
+        except (ValueError, ProcessLookupError):
+            pass  # stale pid file — overwrite below
+        except PermissionError:
+            print(f"Bot already running (PID from {_PID_FILE}), exiting.", flush=True)
+            sys.exit(0)
+
+    with open(_PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
+
+    import atexit
+    atexit.register(lambda: os.path.exists(_PID_FILE) and os.unlink(_PID_FILE))
+
+
 if __name__ == "__main__":
+    _acquire_pid_lock()
     asyncio.run(run())
