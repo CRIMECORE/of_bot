@@ -1,16 +1,25 @@
 import asyncio
+import hashlib
+import hmac
 import html as _html
 import json
 import logging
 import os
+import random
+import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
+
+from aiohttp import web
 
 import pytz
 
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler,
+    MessageHandler, filters, ContextTypes,
+)
 
 from onlymonster import OnlyMonsterClient
 from anthropic_client import AnthropicClient
@@ -28,8 +37,12 @@ SCHEDULE_WEEKDAY_WEEKLY     = 6    # 0=Пн … 6=Вс
 TZ_MSK = pytz.timezone("Europe/Moscow")
 # ──────────────────────────────────────────────────────────────────────────────
 
-FANS_DATA_FILE = Path(__file__).parent / "fans_data.json"
-LOG_FILE       = Path(__file__).parent / "bot.log"
+FANS_DATA_FILE         = Path(__file__).parent / "fans_data.json"
+WEEKLY_REPORTS_FILE    = Path(__file__).parent / "weekly_reports.json"
+STYLE_GUIDE_FILE       = Path(__file__).parent / "style_guide.json"
+SENT_LOG_FILE          = Path(__file__).parent / "sent_log.json"
+BOT_STATUS_FILE        = Path(__file__).parent / "bot_status.json"
+LOG_FILE               = Path(__file__).parent / "bot.log"
 
 PLATFORM_LABELS = {
     "onlyfans": "OnlyFans",
@@ -65,6 +78,76 @@ def load_fans() -> dict:
 def save_fans(fans: dict) -> None:
     with open(FANS_DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(fans, f, ensure_ascii=False, indent=2)
+
+
+def load_weekly_reports() -> list[dict]:
+    if not WEEKLY_REPORTS_FILE.exists():
+        return []
+    with open(WEEKLY_REPORTS_FILE, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return data if isinstance(data, list) else data.get("reports", [])
+
+
+def save_weekly_report(entry: dict) -> None:
+    reports = load_weekly_reports()
+    reports.append(entry)
+    reports = reports[-52:]  # keep last 52 weeks (1 year)
+    with open(WEEKLY_REPORTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(reports, f, ensure_ascii=False, indent=2)
+
+
+def load_style_guide() -> dict:
+    if not STYLE_GUIDE_FILE.exists():
+        return {}
+    with open(STYLE_GUIDE_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_style_guide(data: dict) -> None:
+    with open(STYLE_GUIDE_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def _style_prefix() -> str:
+    """Returns style guide instruction to prepend to fan-facing message prompts."""
+    guide = load_style_guide().get("guide", "")
+    if not guide:
+        return ""
+    return (
+        f"Пиши строго в стиле модели согласно этому style guide:\n{guide}\n\n"
+        "Копируй манеру речи, длину сообщений, использование эмодзи точь-в-точь.\n\n"
+    )
+
+
+def load_bot_status() -> dict:
+    if not BOT_STATUS_FILE.exists():
+        return {}
+    with open(BOT_STATUS_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_bot_status(data: dict) -> None:
+    with open(BOT_STATUS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+
+
+def is_stopped() -> bool:
+    return bool(load_bot_status().get("stop_all"))
+
+
+def load_sent_log() -> list[dict]:
+    if not SENT_LOG_FILE.exists():
+        return []
+    with open(SENT_LOG_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def append_sent_log(entry: dict) -> None:
+    log = load_sent_log()
+    log.append(entry)
+    with open(SENT_LOG_FILE, "w", encoding="utf-8") as f:
+        json.dump(log[-500:], f, ensure_ascii=False, indent=2)
+
 
 
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
@@ -131,20 +214,45 @@ def days_to_birthday(bday_str: str | None) -> int | None:
     return None
 
 
+_TG_MAX_LEN = 4000  # Telegram hard limit is 4096; leave buffer for safety
+
+
+def _split_message(text: str, max_len: int = _TG_MAX_LEN) -> list[str]:
+    """Split text into chunks ≤ max_len, preferring paragraph breaks."""
+    if len(text) <= max_len:
+        return [text]
+    chunks: list[str] = []
+    while len(text) > max_len:
+        pos = text.rfind("\n\n", 0, max_len)
+        if pos < max_len // 3:
+            pos = text.rfind("\n", 0, max_len)
+        if pos < max_len // 3:
+            pos = max_len
+        chunks.append(text[:pos].rstrip())
+        text = text[pos:].lstrip("\n")
+    if text:
+        chunks.append(text)
+    return chunks
+
+
 async def send_to_topic(bot, text: str, topic_id: str | int | None,
-                        reply_markup=None, parse_mode: str | None = None) -> None:
+                        reply_markup=None, parse_mode: str | None = None):
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     if not chat_id:
         logger.error("TELEGRAM_CHAT_ID not set")
-        return
-    kwargs: dict = {}
-    if reply_markup:
-        kwargs["reply_markup"] = reply_markup
-    if topic_id:
-        kwargs["message_thread_id"] = int(topic_id)
-    if parse_mode:
-        kwargs["parse_mode"] = parse_mode
-    await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+        return None
+    chunks = _split_message(text or "—")
+    last_msg = None
+    for i, chunk in enumerate(chunks):
+        kwargs: dict = {}
+        if topic_id:
+            kwargs["message_thread_id"] = int(topic_id)
+        if parse_mode:
+            kwargs["parse_mode"] = parse_mode
+        if reply_markup and i == len(chunks) - 1:
+            kwargs["reply_markup"] = reply_markup
+        last_msg = await bot.send_message(chat_id=chat_id, text=chunk, **kwargs)
+    return last_msg
 
 
 async def send_daily_message(bot, text: str, reply_markup=None,
@@ -162,6 +270,21 @@ async def send_misc_message(bot, text: str, reply_markup=None,
 async def send_chatters_message(bot, text: str, reply_markup=None) -> None:
     """Send to the chatters topic (Чаттерс, thread_id=TELEGRAM_TOPIC_CHATTERS_ID)."""
     await send_to_topic(bot, text, os.getenv("TELEGRAM_TOPIC_CHATTERS_ID"), reply_markup)
+
+
+async def send_alerts_message(bot, text: str, reply_markup=None) -> None:
+    """Send to the alerts topic (Оповещения, thread_id=TELEGRAM_TOPIC_ALERTS_ID)."""
+    await send_to_topic(bot, text, os.getenv("TELEGRAM_TOPIC_ALERTS_ID"), reply_markup)
+
+
+async def send_nightdrive_message(bot, text: str, reply_markup=None):
+    """Send to the nightdrive topic (thread_id=TELEGRAM_TOPIC_NIGHTDRIVE_ID). Returns Message."""
+    return await send_to_topic(bot, text, os.getenv("TELEGRAM_TOPIC_NIGHTDRIVE_ID", "52"), reply_markup)
+
+
+async def send_broadcasts_message(bot, text: str, reply_markup=None):
+    """Send to the broadcasts topic (thread_id=TELEGRAM_TOPIC_BROADCASTS_ID). Returns Message."""
+    return await send_to_topic(bot, text, os.getenv("TELEGRAM_TOPIC_BROADCASTS_ID", "94"), reply_markup)
 
 
 # ─── /analyze ─────────────────────────────────────────────────────────────────
@@ -1215,6 +1338,657 @@ async def run_weekly_analyze(app: Application) -> None:
     logger.info("run_weekly_analyze done: new=%d upd=%d skip=%d fail=%d", created, updated, skipped, failed)
 
 
+# ─── STYLE GUIDE ─────────────────────────────────────────────────────────────
+
+_STYLE_LEARN_PROMPT = """\
+Проанализируй эти исходящие сообщения от модели OnlyFans и составь детальный style guide.
+
+Сообщений для анализа: {count}
+
+{messages}
+
+Составь детальный style guide на русском:
+
+1. ДЛИНА СООБЩЕНИЙ — типичная (количество слов/предложений, примеры коротких и длинных)
+2. ТОН И МАНЕРА — формальный/неформальный, тёплый/холодный, игривый/серьёзный
+3. ТИПИЧНЫЕ ФРАЗЫ И ОБОРОТЫ — конкретные выражения которые часто повторяются
+4. КАК НАЧИНАЮТ СООБЩЕНИЯ — типичные зачины, приветствия
+5. КАК ЗАКАНЧИВАЮТ — типичные концовки, прощания
+6. ЭМОДЗИ — какие используют, как часто, в каких ситуациях (или не используют вообще)
+7. ФЛИРТ — как флиртуют, какие слова/образы используют
+8. ПРЕДЛОЖЕНИЕ КОНТЕНТА И PPV — как предлагают, какие формулировки, как называют цену
+9. ЧТО НИКОГДА НЕ ПИШУТ — табу, слова и фразы которых нет в переписке
+10. ПРИМЕРЫ — 5-7 типичных сообщений разных типов (флирт, ответ на вопрос, предложение контента, реактивация, благодарность)
+"""
+
+
+async def _collect_outgoing_messages(limit: int = 200) -> list[str]:
+    """Collect up to `limit` recent outgoing messages from active fan chats."""
+    fans     = load_fans()
+    accounts = await asyncio.to_thread(get_all_accounts)
+
+    # Sort fans by last_message_date — most recent first
+    sorted_fans = sorted(
+        [(fid, fd) for fid, fd in fans.items() if fd.get("last_message_date")],
+        key=lambda x: x[1].get("last_message_date", ""),
+        reverse=True,
+    )
+
+    outgoing: list[str] = []
+    acc_map  = {acct["id"]: acct for acct in accounts}
+
+    for fid, fdata in sorted_fans:
+        if len(outgoing) >= limit:
+            break
+        acc_id = fdata.get("account_id") or (accounts[0]["id"] if accounts else "")
+        if not acc_id:
+            continue
+        try:
+            msgs = await asyncio.wait_for(
+                asyncio.to_thread(om_client.get_messages, acc_id, fid, 50),
+                timeout=10,
+            )
+        except Exception:
+            continue
+        for m in msgs:
+            if m.get("is_sent_by_me"):
+                txt = _clean(_TAG.sub("", str(m.get("text") or ""))).strip()
+                if txt and len(txt) > 3:
+                    outgoing.append(txt)
+                    if len(outgoing) >= limit:
+                        break
+
+    return outgoing
+
+
+async def _do_learn_style() -> tuple[str, int]:
+    """Collect outgoing messages, analyze with Claude, save style guide. Returns (guide, count)."""
+    outgoing = await _collect_outgoing_messages(200)
+    if not outgoing:
+        raise ValueError("Нет исходящих сообщений для анализа")
+
+    # Deduplicate and truncate each message for the prompt
+    seen: set[str] = set()
+    unique: list[str] = []
+    for txt in outgoing:
+        key = txt[:50]
+        if key not in seen:
+            seen.add(key)
+            unique.append(txt[:300])
+
+    numbered = "\n".join(f"{i+1}. {t}" for i, t in enumerate(unique[:200]))
+    prompt   = _STYLE_LEARN_PROMPT.format(count=len(unique), messages=numbered)
+    guide    = await asyncio.to_thread(claude_client.chat, prompt)
+
+    save_style_guide({
+        "created_at":        datetime.now().isoformat(),
+        "messages_analyzed": len(unique),
+        "guide":             guide,
+    })
+    return guide, len(unique)
+
+
+async def cmd_learn_style(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = await update.message.reply_text("⏳ Собираю исходящие сообщения из чатов...")
+    try:
+        guide, count = await _do_learn_style()
+        preview = guide[:800] + ("…" if len(guide) > 800 else "")
+        await msg.edit_text(
+            f"✅ Style guide создан на основе {count} сообщений!\n\n"
+            f"Превью:\n{preview}\n\n"
+            f"Полный гайд: /show_style"
+        )
+        logger.info("learn_style: guide created from %d messages", count)
+    except Exception as e:
+        logger.exception("cmd_learn_style failed")
+        await msg.edit_text(f"❌ Ошибка: {e}")
+
+
+async def cmd_update_style(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Same as /learn_style — refreshes the style guide with fresh messages."""
+    await cmd_learn_style(update, context)
+
+
+async def cmd_show_style(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    guide_data = load_style_guide()
+    if not guide_data:
+        await update.message.reply_text("❌ Style guide ещё не создан. Запусти /learn_style")
+        return
+    guide    = guide_data.get("guide", "")
+    count    = guide_data.get("messages_analyzed", "?")
+    created  = guide_data.get("created_at", "?")[:10]
+    header   = f"📖 Style guide (создан {created}, на основе {count} сообщений):\n\n"
+
+    # Split into chunks ≤ 4000 chars for Telegram
+    full = header + guide
+    for i in range(0, len(full), 4000):
+        await update.message.reply_text(full[i:i+4000])
+
+
+async def _auto_update_style_if_needed(app: Application) -> None:
+    guide = load_style_guide()
+    if guide:
+        last = parse_dt(guide.get("created_at"))
+        if last and (datetime.now() - last).days < 14:
+            return  # fresh enough
+    logger.info("Auto-updating style guide (14+ days old or missing)")
+    try:
+        guide_text, count = await _do_learn_style()
+        logger.info("Auto style update done: %d messages", count)
+    except Exception:
+        logger.exception("_auto_update_style_if_needed failed")
+
+
+# ─── WEEKLY AI REPORT ────────────────────────────────────────────────────────
+
+_WEEKLY_AI_PROMPT = """\
+Ты — аналитик OnlyFans агентства. Напиши еженедельный отчёт на русском по предоставленным данным.
+
+ДАННЫЕ ЗА НЕДЕЛЮ ({week_start} — {week_end}):
+
+💰 Финансы:
+- Итого: ${total_earned:.0f} (PPV: ${ppv_total:.0f} | Типы: ${tips_total:.0f} | Посты: ${posts_total:.0f})
+- Транзакций: {txn_count}, средний чек: ${avg_check:.0f}
+- Прошлая неделя: {prev_total_str}
+- Топ плательщики: {top3_str}
+
+👥 Фаны:
+- Подписались за неделю: {new_fans_count} ({new_fans_names})
+- Молчат 7+ дней и потратили 100$+: {at_risk_str}
+
+💬 Чаттеры:
+{chatters_str}
+
+📜 История (последние недели):
+{history_str}
+{extra_data}
+Напиши отчёт СТРОГО в таком формате (без лишнего текста до/после):
+
+📊 Еженедельный анализ {week_start} — {week_end}
+
+💰 ФИНАНСЫ:
+- Итого: ${total_earned:.0f} [больше/меньше/столько же что прошлая неделя, %]
+- PPV (сообщения): ${ppv_total:.0f} | Типы: ${tips_total:.0f} | Посты: ${posts_total:.0f}
+- Средний чек: ${avg_check:.0f}
+- Топ плательщики: [Имя $X, Имя $X, Имя $X]
+
+👥 ФАНЫ:
+- Новых подписчиков: {new_fans_count} (с подпиской на этой неделе)
+- Реактивированных: [оцени по данным]
+- Молчат и богатые (риск потери): [список или "нет"]
+
+💬 ЧАТТЕРЫ:
+[по каждому: имя, продажи, время ответа]
+
+🔍 ПРОБЛЕМЫ:
+[2-3 конкретных проблемы с цифрами из данных]
+
+🎯 РЕКОМЕНДАЦИИ НА СЛЕДУЮЩУЮ НЕДЕЛЮ:
+[2-3 конкретных действия]
+
+📈 ДИНАМИКА:
+[сравнение с прошлыми неделями, тренд, вывод]
+{extra_instructions}"""
+
+
+async def _collect_weekly_data(now_msk: datetime) -> dict:
+    """Collect all raw data for weekly AI report. No Claude involved."""
+    week_start_msk = now_msk - timedelta(days=7)
+    start_iso = (week_start_msk - timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    end_iso   = (now_msk       - timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+    # Load history first — used in multiple sections below
+    prev_reports = load_weekly_reports()
+
+    # 1. Transactions for the week
+    accounts = await asyncio.to_thread(get_all_accounts)
+    all_txns: list[dict] = []
+    for acct in accounts:
+        plat_acc = acct.get("platform_account_id", "")
+        if not plat_acc:
+            continue
+        try:
+            batch = await asyncio.wait_for(
+                asyncio.to_thread(
+                    om_client.get_all_transactions_paged, plat_acc, 7, start_iso, end_iso
+                ),
+                timeout=90,
+            )
+            all_txns.extend(batch)
+        except Exception as e:
+            logger.warning("_collect_weekly_data txns for %s: %s", plat_acc, e)
+
+    ppv_total   = 0.0
+    tips_total  = 0.0
+    posts_total = 0.0
+    txn_count   = 0
+    for txn in all_txns:
+        amt = float(txn.get("amount") or 0)
+        if amt <= 0:
+            continue
+        txn_count += 1
+        t = str(txn.get("type") or "").lower()
+        if "payment for message" in t:
+            ppv_total += amt
+        elif "tip" in t:
+            tips_total += amt
+        elif "post purchase" in t:
+            posts_total += amt
+        # other types also count toward total
+    total_earned = ppv_total + tips_total + posts_total
+    avg_check    = total_earned / txn_count if txn_count else 0.0
+
+    # 2. Top-3 fans by week spending
+    fan_week: dict[str, float] = {}
+    for txn in all_txns:
+        fid = str((txn.get("fan") or {}).get("id") or "")
+        amt = float(txn.get("amount") or 0)
+        if fid and amt > 0:
+            fan_week[fid] = fan_week.get(fid, 0.0) + amt
+    fans   = load_fans()
+    top3   = sorted(fan_week.items(), key=lambda x: x[1], reverse=True)[:3]
+    top3_named = [(fan_display_name(fid, fans.get(fid, {})), amt) for fid, amt in top3]
+
+    # 3. New subscribers this week — compare current fan list vs previous week's snapshot
+    current_fan_ids: set[str] = set()
+    for acct in accounts:
+        try:
+            ids = await asyncio.wait_for(
+                asyncio.to_thread(om_client.get_fan_ids, acct["id"]),
+                timeout=30,
+            )
+            current_fan_ids.update(str(fid) for fid in ids)
+        except Exception as e:
+            logger.warning("get_fan_ids for acc %s: %s", acct["id"], e)
+
+    prev_fan_ids  = set(prev_reports[-1].get("fan_ids", [])) if prev_reports else set()
+    new_sub_ids   = current_fan_ids - prev_fan_ids
+    new_fans_count_real = len(new_sub_ids)
+    new_fans = [fan_display_name(fid, fans.get(fid, {})) for fid in list(new_sub_ids)[:15]]
+
+    # 4. At-risk fans (7+ days silent, 100$+ spent)
+    at_risk: list[tuple[str, float, int]] = []
+    for fid, fdata in fans.items():
+        if fdata.get("blocked"):
+            continue
+        total = float(fdata.get("total_spent") or fdata.get("payment_total") or 0)
+        if total < 100:
+            continue
+        last_dt = parse_dt(fdata.get("last_message_date"))
+        if last_dt:
+            days_s = (now_msk - last_dt).days
+            if days_s >= 7:
+                at_risk.append((fan_display_name(fid, fdata), total, days_s))
+    at_risk.sort(key=lambda x: x[1], reverse=True)
+
+    # 5. Chatter metrics + shift-based sales
+    chatters = load_chatters()
+    user_ids = [ch["user_id"] for ch in chatters if ch.get("user_id")]
+    metrics_by_uid: dict[int, dict] = {}
+    if user_ids:
+        try:
+            ml = await asyncio.wait_for(
+                asyncio.to_thread(om_client.get_users_metrics, user_ids, start_iso, end_iso),
+                timeout=20,
+            )
+            for m in ml:
+                uid = m.get("user_id") or m.get("id")
+                if uid is not None:
+                    metrics_by_uid[int(uid)] = m
+        except Exception as e:
+            logger.warning("_collect_weekly_data metrics: %s", e)
+
+    chatter_sales: dict[str, float] = {ch["name"]: 0.0 for ch in chatters}
+    for txn in all_txns:
+        raw_ts = txn.get("timestamp") or txn.get("created_at")
+        dt_utc = parse_dt(str(raw_ts)) if raw_ts else None
+        if not dt_utc:
+            continue
+        ch = _chatter_for_hour((dt_utc + timedelta(hours=3)).hour, chatters)
+        if ch:
+            chatter_sales[ch["name"]] += float(txn.get("amount") or 0)
+
+    chatter_stats: list[dict] = []
+    for ch in chatters:
+        uid = ch.get("user_id")
+        m   = metrics_by_uid.get(uid, {}) if uid else {}
+        chatter_stats.append({
+            "name":           ch["name"],
+            "sales":          chatter_sales[ch["name"]],
+            "messages":       int(m.get("messages_count") or m.get("message_count") or 0),
+            "reply_time_avg": float(m.get("reply_time_avg") or 0),
+        })
+
+    # 6. Previous reports for comparison
+    prev_total = prev_reports[-1].get("total_earned") if prev_reports else None
+
+    # 7. Broadcast stats — auto-detected via detect_broadcasts()
+    broadcast_stats: dict = {"count": 0, "recipients": 0, "replied": 0, "revenue": 0.0, "top_text": ""}
+    try:
+        detected_bc = await detect_broadcasts(days=7, prefetched_txns=all_txns)
+        if detected_bc:
+            broadcast_stats["count"]      = len(detected_bc)
+            broadcast_stats["recipients"] = sum(b["recipients"] for b in detected_bc)
+            broadcast_stats["replied"]    = sum(b["replied"]    for b in detected_bc)
+            broadcast_stats["revenue"]    = sum(b["revenue"]    for b in detected_bc)
+            broadcast_stats["top_text"]   = detected_bc[0]["text"][:80]
+    except Exception as e:
+        logger.warning("_collect_weekly_data broadcasts: %s", e)
+
+    # 8. Pricing analysis — top price points by revenue
+    pricing_top: list[tuple[float, int, float]] = []
+    try:
+        price_counts: dict[float, int] = {}
+        price_rev: dict[float, float] = {}
+        for txn in all_txns:
+            amt = round(float(txn.get("amount") or 0), 2)
+            if amt > 0:
+                price_counts[amt] = price_counts.get(amt, 0) + 1
+                price_rev[amt] = price_rev.get(amt, 0.0) + amt
+        pricing_top = sorted(
+            [(amt, price_counts[amt], price_rev[amt]) for amt in price_counts],
+            key=lambda x: x[2], reverse=True,
+        )[:5]
+    except Exception as e:
+        logger.warning("_collect_weekly_data pricing: %s", e)
+
+    # 9. Refusal stats — PPVs viewed but not purchased (top fans by week spend)
+    refusal_list: list[tuple[str, float]] = []
+    try:
+        top5_week = sorted(fan_week.items(), key=lambda x: x[1], reverse=True)[:5]
+        for fan_id_r, _ in top5_week:
+            fdata_r = fans.get(fan_id_r, {})
+            acc_id_r = fdata_r.get("account_id") or (accounts[0]["id"] if accounts else "")
+            if not acc_id_r:
+                continue
+            try:
+                msgs_r = await asyncio.wait_for(
+                    asyncio.to_thread(om_client.get_messages, acc_id_r, fan_id_r, 30),
+                    timeout=10,
+                )
+                for m in msgs_r:
+                    if m.get("is_opened") and m.get("can_purchase") and not m.get("is_purchased"):
+                        price = float(m.get("price") or 0)
+                        refusal_list.append((fan_display_name(fan_id_r, fdata_r), price))
+            except Exception as e_r:
+                logger.warning("refusal check fan %s: %s", fan_id_r, e_r)
+    except Exception as e:
+        logger.warning("_collect_weekly_data refusals: %s", e)
+
+    return {
+        "week_start":    week_start_msk.strftime("%d.%m.%Y"),
+        "week_end":      now_msk.strftime("%d.%m.%Y"),
+        "start_iso":     start_iso,
+        "end_iso":       end_iso,
+        "total_earned":  total_earned,
+        "txn_count":        txn_count,
+        "avg_check":        avg_check,
+        "ppv_total":        ppv_total,
+        "tips_total":       tips_total,
+        "posts_total":      posts_total,
+        "top3":             top3_named,
+        "new_fans":         new_fans,
+        "new_fans_count":   new_fans_count_real,
+        "current_fan_ids":  list(current_fan_ids),
+        "at_risk":          at_risk,
+        "chatter_stats":    chatter_stats,
+        "prev_total":       prev_total,
+        "prev_reports":     prev_reports[-4:],
+        "broadcast_stats":  broadcast_stats,
+        "pricing_top":      pricing_top,
+        "refusal_list":     refusal_list,
+    }
+
+
+def _build_weekly_prompt(d: dict) -> str:
+    prev_total_str = f"${d['prev_total']:.0f}" if d["prev_total"] is not None else "нет данных"
+    top3_str = ", ".join(f"{n} ${a:.0f}" for n, a in d["top3"]) or "нет данных"
+    new_fans_count = d.get("new_fans_count", len(d["new_fans"]))
+    new_names = ", ".join(d["new_fans"][:10]) if d["new_fans"] else ("нет данных (первый запуск)" if not d.get("new_fans_count") else "нет")
+    at_risk_str = (
+        "; ".join(f"{n} (${a:.0f}, {ds} дн)" for n, a, ds in d["at_risk"][:5])
+        or "нет"
+    )
+    chatters_lines = []
+    for cs in d["chatter_stats"]:
+        rtime = f"{int(cs['reply_time_avg'] // 60)} мин" if cs["reply_time_avg"] else "N/A"
+        chatters_lines.append(
+            f"  {cs['name']}: ${cs['sales']:.0f} продаж, "
+            f"{cs['messages'] or 'N/A'} сообщ., ответ {rtime}"
+        )
+    history_lines = []
+    for r in d["prev_reports"]:
+        history_lines.append(
+            f"  {r.get('week_start','?')}–{r.get('week_end','?')}: "
+            f"${r.get('total_earned', 0):.0f}, "
+            f"чеков {r.get('txn_count', 0)}, "
+            f"avg ${r.get('avg_check', 0):.0f}"
+        )
+    # ── extra data sections (broadcast / pricing / refusal) ──────────────────
+    bs = d.get("broadcast_stats", {})
+    extra_data = ""
+    if bs.get("count", 0) > 0:
+        n   = bs["recipients"]
+        r   = bs["replied"]
+        rate = f"{r/n*100:.0f}%" if n else "0%"
+        extra_data += (
+            f"\n📢 Рассылки за неделю (авто-обнаружены):\n"
+            f"- Рассылок: {bs['count']}, охват: {n} фанов\n"
+            f"- Ответили: {r} ({rate}), доход после: ${bs['revenue']:.0f}\n"
+            f"- Топ текст: «{bs['top_text']}»\n"
+        )
+    pricing_top = d.get("pricing_top", [])
+    if len(pricing_top) >= 2:
+        lines_p = [f"  ${amt:.0f}: {cnt} продаж = ${rev:.0f}" for amt, cnt, rev in pricing_top[:5]]
+        extra_data += "\n💸 Чеки по размеру:\n" + "\n".join(lines_p) + "\n"
+    refusal_list = d.get("refusal_list", [])
+    if refusal_list:
+        lines_r = [f"  {name}: ${price:.0f}" for name, price in refusal_list[:5]]
+        extra_data += "\n📉 Открыли PPV но не купили:\n" + "\n".join(lines_r) + "\n"
+
+    # ── extra output format instructions ─────────────────────────────────────
+    extra_instructions = ""
+    if bs.get("total_sent", 0) > 0:
+        extra_instructions += (
+            "\n📢 АНАЛИЗ РАССЫЛОК:\n"
+            "- Конверсия [%] и доход $X\n"
+            "- Вывод: был ли смысл? Что улучшить в тексте?\n"
+        )
+    if len(pricing_top) >= 2:
+        extra_instructions += (
+            "\n💸 ЦЕНООБРАЗОВАНИЕ:\n"
+            "- Самый прибыльный чек: $X (N продаж)\n"
+            "- Рекомендация по ценообразованию на следующую неделю\n"
+        )
+    if refusal_list:
+        extra_instructions += (
+            "\n📉 АНАЛИЗ ОТКАЗОВ:\n"
+            "- Сколько фанов открыли но не купили, на какую сумму\n"
+            "- Причина и как дожать\n"
+        )
+    extra_instructions += (
+        "\n💡 ИДЕИ ДЛЯ РАССЫЛОК НА СЛЕДУЮЩУЮ НЕДЕЛЮ:\n"
+        "1. [конкретная идея с примером текста, на основе данных о лучших фанах]\n"
+        "2. [вторая идея с примером текста]\n"
+        "3. [третья идея с примером текста]\n"
+    )
+
+    return _WEEKLY_AI_PROMPT.format(
+        week_start    = d["week_start"],
+        week_end      = d["week_end"],
+        total_earned  = d["total_earned"],
+        ppv_total     = d.get("ppv_total", 0),
+        tips_total    = d.get("tips_total", 0),
+        posts_total   = d.get("posts_total", 0),
+        txn_count     = d["txn_count"],
+        avg_check     = d["avg_check"],
+        prev_total_str= prev_total_str,
+        top3_str      = top3_str,
+        new_fans_count= new_fans_count,
+        new_fans_names= new_names,
+        at_risk_str   = at_risk_str,
+        chatters_str  = "\n".join(chatters_lines) or "  нет данных",
+        history_str   = "\n".join(history_lines) or "  нет истории",
+        extra_data    = extra_data,
+        extra_instructions = extra_instructions,
+    )
+
+
+def _extract_broadcast_ideas(report_text: str) -> str | None:
+    """Extract the 💡 ИДЕИ section from the weekly report, or None if absent."""
+    idx = report_text.find("💡")
+    return report_text[idx:].strip() if idx != -1 else None
+
+
+_BROADCAST_AI_PROMPT = """\
+Ты — эксперт по монетизации OnlyFans. Проанализируй рассылки чаттеров за прошедшие 7 дней и дай конкретные рекомендации по улучшению.
+
+ДАННЫЕ О РАССЫЛКАХ:
+{broadcasts_text}
+
+Напиши анализ СТРОГО в этом формате (без вступлений):
+
+📢 АНАЛИЗ РАССЫЛОК
+
+📊 РЕЗУЛЬТАТЫ:
+[по каждой рассылке: текст → ответов → доход → оценка 1-5]
+
+🏆 ЧТО СРАБОТАЛО:
+[конкретно что в топ-рассылках зацепило фанов]
+
+❌ ЧТО НЕ СРАБОТАЛО:
+[конкретно почему слабые рассылки не дали результат]
+
+💡 3 УЛУЧШЕННЫХ ВАРИАНТА ДЛЯ СЛЕДУЮЩЕЙ НЕДЕЛИ:
+1. «[текст]» — [почему лучше]
+2. «[текст]» — [почему лучше]
+3. «[текст]» — [почему лучше]
+
+🎯 РЕКОМЕНДАЦИЯ:
+[конкретный план по рассылкам на следующую неделю, 2-3 пункта]
+"""
+
+
+async def _run_broadcast_ai_report(app: Application) -> None:
+    """Weekly AI analysis of chatters' broadcasts → sends to topic 94."""
+    logger.info("Broadcast AI report: detecting broadcasts")
+    try:
+        results = await detect_broadcasts(days=7)
+        if not results:
+            logger.info("Broadcast AI report: no broadcasts found, skipping")
+            return
+
+        broadcasts_text = ""
+        for i, b in enumerate(results[:10], 1):
+            n    = b["recipients"]
+            r    = b["replied"]
+            rate = f"{r/n*100:.0f}%" if n else "0%"
+            dt   = b["sent_at"][:16].replace("T", " ")
+            broadcasts_text += (
+                f"{i}. Текст: «{b['text'][:200]}»\n"
+                f"   Дата: {dt} | Фанов: {n} | Ответили: {r} ({rate}) | Доход: ${b['revenue']:.0f}\n\n"
+            )
+
+        prompt = _BROADCAST_AI_PROMPT.format(broadcasts_text=broadcasts_text)
+        logger.info("Broadcast AI report: calling Claude")
+        report = await asyncio.to_thread(claude_client.chat, prompt)
+
+        await send_broadcasts_message(app.bot, report)
+        logger.info("Broadcast AI report: sent to topic 94")
+    except Exception:
+        logger.exception("_run_broadcast_ai_report failed")
+
+
+async def _run_weekly_ai_report(app: Application) -> None:
+    logger.info("Weekly AI report: collecting data")
+    try:
+        now_msk = datetime.now(TZ_MSK).replace(tzinfo=None)
+        data    = await _collect_weekly_data(now_msk)
+        prompt  = _build_weekly_prompt(data)
+
+        logger.info("Weekly AI report: calling Claude")
+        report_text = await asyncio.to_thread(claude_client.chat, prompt)
+
+        await send_daily_message(app.bot, report_text)
+        logger.info("Weekly AI report: sent to Дневная инфа")
+
+        ideas = _extract_broadcast_ideas(report_text)
+        if ideas:
+            await send_broadcasts_message(app.bot, ideas)
+            logger.info("Weekly AI report: broadcast ideas sent to topic 94")
+
+        # Save to history
+        entry = {
+            "created_at":    now_msk.isoformat(),
+            "week_start":    data["week_start"],
+            "week_end":      data["week_end"],
+            "total_earned":  data["total_earned"],
+            "txn_count":     data["txn_count"],
+            "avg_check":     data["avg_check"],
+            "new_subs":      data.get("new_fans_count", 0),
+            "fan_ids":       data.get("current_fan_ids", []),
+            "ppv_total":     data.get("ppv_total", 0),
+            "tips_total":    data.get("tips_total", 0),
+            "posts_total":   data.get("posts_total", 0),
+            "chatters":      {
+                cs["name"]: {
+                    "sales":          cs["sales"],
+                    "messages":       cs["messages"],
+                    "reply_time_avg": cs["reply_time_avg"],
+                }
+                for cs in data["chatter_stats"]
+            },
+            "summary": report_text[:500],
+        }
+        save_weekly_report(entry)
+        logger.info("Weekly AI report: saved to weekly_reports.json")
+
+    except Exception:
+        logger.exception("_run_weekly_ai_report failed")
+
+
+async def cmd_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Manually trigger the weekly AI report."""
+    msg = await update.message.reply_text("⏳ Собираю данные за неделю...")
+    try:
+        now_msk = datetime.now(TZ_MSK).replace(tzinfo=None)
+        data    = await _collect_weekly_data(now_msk)
+        await msg.edit_text("🤖 Данные собраны, генерирую AI анализ...")
+        prompt  = _build_weekly_prompt(data)
+        report_text = await asyncio.to_thread(claude_client.chat, prompt)
+
+        await send_daily_message(context.bot, report_text)
+
+        ideas = _extract_broadcast_ideas(report_text)
+        if ideas:
+            await send_broadcasts_message(context.bot, ideas)
+
+        entry = {
+            "created_at":   now_msk.isoformat(),
+            "week_start":   data["week_start"],
+            "week_end":     data["week_end"],
+            "total_earned": data["total_earned"],
+            "txn_count":    data["txn_count"],
+            "avg_check":    data["avg_check"],
+            "new_subs":     data.get("new_fans_count", 0),
+            "fan_ids":      data.get("current_fan_ids", []),
+            "chatters": {
+                cs["name"]: {
+                    "sales":          cs["sales"],
+                    "messages":       cs["messages"],
+                    "reply_time_avg": cs["reply_time_avg"],
+                }
+                for cs in data["chatter_stats"]
+            },
+            "summary": report_text[:500],
+        }
+        save_weekly_report(entry)
+        await msg.edit_text("✅ Еженедельный отчёт отправлен в «Дневная инфа»")
+    except Exception as e:
+        logger.exception("cmd_weekly failed")
+        await msg.edit_text(f"❌ Ошибка: {e}")
+
+
 # ─── SCHEDULER LOOP ───────────────────────────────────────────────────────────
 
 async def scheduler_loop(app: Application) -> None:
@@ -1223,6 +1997,9 @@ async def scheduler_loop(app: Application) -> None:
     synced_today              : set[str] = set()
     chatter_reported_today    : set[str] = set()
     reactivation_done_week    : set[str] = set()
+    weekly_ai_done_week       : set[str] = set()
+    broadcast_ai_done_week    : set[str] = set()
+    nightdrive_done_today     : set[str] = set()
 
     while True:
         now  = datetime.now()
@@ -1266,11 +2043,38 @@ async def scheduler_loop(app: Application) -> None:
             asyncio.create_task(_run_reactivation_report(app))
             logger.info("Scheduler: reactivation report triggered")
 
+        # Sunday 14:00 MSK → weekly AI report → topic "Дневная инфа"
+        if (msk.weekday() == SCHEDULE_WEEKDAY_WEEKLY and msk.hour == 14
+                and msk.minute == 0 and week not in weekly_ai_done_week):
+            weekly_ai_done_week.add(week)
+            asyncio.create_task(_run_weekly_ai_report(app))
+            logger.info("Scheduler: weekly AI report triggered")
+
+        # Sunday 15:00 MSK → broadcast AI analysis → topic 94
+        if (msk.weekday() == SCHEDULE_WEEKDAY_WEEKLY and msk.hour == 15
+                and msk.minute == 0 and week not in broadcast_ai_done_week):
+            broadcast_ai_done_week.add(week)
+            asyncio.create_task(_run_broadcast_ai_report(app))
+            logger.info("Scheduler: broadcast AI report triggered")
+
+        # Sunday 03:00 MSK → auto-refresh style guide if 14+ days old
+        if (msk.weekday() == SCHEDULE_WEEKDAY_WEEKLY and msk.hour == 3
+                and msk.minute == 0):
+            asyncio.create_task(_auto_update_style_if_needed(app))
+            logger.info("Scheduler: style guide auto-update check triggered")
+
+        # 00:00 MSK daily → reset daily counters + run nightdrive
+        if msk.hour == 0 and msk.minute == 0 and today not in nightdrive_done_today:
+            nightdrive_done_today.add(today)
+            asyncio.create_task(_reset_daily_message_counts())
+            asyncio.create_task(_run_nightdrive(app))
+            logger.info("Scheduler: nightdrive triggered")
+
 
 # ─── REACTIVATION ─────────────────────────────────────────────────────────────
 
 _REACTIVATION_PROMPT = """\
-You are a chatter working for a creator on OnlyFans. Never mention competing platforms.
+{style_prefix}You are a chatter working for a creator on OnlyFans. Never mention competing platforms.
 Write a personal reactivation message to a fan who has gone quiet, on behalf of the creator.
 
 Fan profile:
@@ -1389,6 +2193,7 @@ async def handle_reactivate(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     profile_text = "\n".join(profile_lines) or "No profile data available"
 
     prompt = _REACTIVATION_PROMPT.format(
+        style_prefix=_style_prefix(),
         profile_text=profile_text,
         total_spent=total_spent,
         last_purchase=last_purchase,
@@ -1474,6 +2279,728 @@ async def cmd_reactivation(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await msg.edit_text(f"❌ Ошибка: {e}")
 
 
+# ─── NIGHTDRIVE ────────────────────────────────────────────────────────────────
+
+# Module-level state
+_nd_texts       : dict[str, dict] = {}  # fan_id → {text, account_id, dname}
+_nd_edit_pending: dict[int, dict] = {}  # prompt_msg_id → {fan_id, account_id, dname, orig_msg}
+_nd_sent_tonight: int             = 0
+_nd_last_sent   : datetime | None = None
+
+_NIGHTDRIVE_PROMPT = """\
+{style_prefix}You are a chatter for an OnlyFans creator. Write a short, personal re-engagement message \
+to a fan who has gone quiet.
+
+Fan profile:
+{profile_text}
+
+Spent ${total_spent:.0f} total. Silent for {days_silent} days.
+
+Requirements:
+- MAXIMUM 2 sentences — short and natural
+- Write as the creator herself, first person
+- Match the style guide exactly: same tone, emoji usage, phrasing
+- Warm and personal — make them feel the creator thought of them specifically
+- Do NOT mention they've been quiet or away
+- No pressure, no sales pitch — just a genuine, flirty check-in
+- Output ONLY the message text, no quotes, no commentary
+"""
+
+
+async def _check_unanswered_streak(account_id: str, fan_id: str) -> int:
+    """Count consecutive trailing outgoing messages with no fan reply."""
+    try:
+        msgs = await asyncio.wait_for(
+            asyncio.to_thread(om_client.get_messages, account_id, fan_id, 20),
+            timeout=10,
+        )
+    except Exception:
+        return 0
+    streak = 0
+    for m in reversed(msgs):
+        if m.get("is_sent_by_me"):
+            streak += 1
+        else:
+            break
+    return streak
+
+
+async def _do_nd_send(
+    app: Application,
+    fan_id: str,
+    account_id: str,
+    text: str,
+    dname: str,
+    orig_msg,
+    delay_mins: int,
+    edited: bool = False,
+) -> None:
+    global _nd_sent_tonight, _nd_last_sent
+
+    logger.info(
+        "nd_send START: fan_id=%s account_id=%s delay=%dm edited=%s text=%r",
+        fan_id, account_id, delay_mins, edited, text[:100],
+    )
+
+    await asyncio.sleep(delay_mins * 60)
+
+    if _nd_sent_tonight >= 5:
+        logger.info("nd_send: limit reached during delay, aborting fan=%s", fan_id)
+        try:
+            await orig_msg.edit_text(f"🚫 Лимит 5 сообщений — отмена для {dname}")
+        except Exception:
+            pass
+        return
+
+    if is_stopped():
+        logger.info("nd_send: aborted — stop_all active (fan=%s)", fan_id)
+        try:
+            await orig_msg.edit_text(f"🛑 Остановлено — {dname}")
+        except Exception:
+            pass
+        return
+
+    logger.info("nd_send: calling OM API send_message fan=%s acc=%s", fan_id, account_id)
+    try:
+        result = await asyncio.to_thread(om_client.send_message, account_id, fan_id, text)
+        logger.info("nd_send: OM API response: %s", result)
+    except Exception as e:
+        logger.error("nd_send: OM API FAILED fan=%s: %s", fan_id, e, exc_info=True)
+        try:
+            await orig_msg.edit_text(f"❌ Ошибка отправки — {dname}: {e}")
+        except Exception:
+            pass
+        return
+
+    # Update fans_data
+    fans = load_fans()
+    if fan_id in fans:
+        fans[fan_id]["last_reply_date"]     = datetime.now().strftime("%Y-%m-%d")
+        fans[fan_id]["daily_message_count"] = int(fans[fan_id].get("daily_message_count", 0)) + 1
+    save_fans(fans)
+
+    append_sent_log({
+        "date":       datetime.now().isoformat(),
+        "fan_id":     fan_id,
+        "fan_name":   dname,
+        "account_id": account_id,
+        "text":       text,
+        "edited":     edited,
+    })
+
+    _nd_sent_tonight += 1
+    _nd_last_sent     = datetime.now()
+    logger.info("nd_send: SUCCESS fan=%s sent_tonight=%d", fan_id, _nd_sent_tonight)
+
+    label = "✅ Отправлено (отредактировано)" if edited else "✅ Отправлено"
+
+    # Update the original card
+    try:
+        await orig_msg.edit_text(
+            f"{label} — {dname} (через {delay_mins} мин)\n\n"
+            f'✍️ "{text[:200]}"'
+        )
+    except Exception as ex:
+        logger.warning("nd_send: could not edit orig_msg: %s", ex)
+
+    # Always send a visible confirmation message in the topic
+    try:
+        await send_nightdrive_message(
+            app.bot,
+            f"{label} — {dname}\n✍️ \"{text[:150]}\""
+        )
+    except Exception as ex:
+        logger.warning("nd_send: confirmation message failed: %s", ex)
+
+    # Auto-stop if 3 consecutive unanswered messages
+    streak = await _check_unanswered_streak(account_id, fan_id)
+    logger.info("nd_send: unanswered streak for fan=%s: %d", fan_id, streak)
+    if streak >= 3:
+        fans = load_fans()
+        if fan_id in fans:
+            fans[fan_id]["auto_stopped"] = True
+            save_fans(fans)
+            logger.info("nd_send: auto_stopped fan=%s (streak=%d)", fan_id, streak)
+        try:
+            await send_nightdrive_message(
+                app.bot,
+                f"⚠️ {dname} добавлен в стоп-лист: 3 сообщения подряд без ответа"
+            )
+        except Exception:
+            pass
+
+
+async def _run_nightdrive(app: Application) -> None:
+    global _nd_sent_tonight
+    _nd_sent_tonight = 0
+    _nd_texts.clear()
+    _nd_edit_pending.clear()
+
+    if is_stopped():
+        logger.info("nightdrive: stop_all active, skipping")
+        return
+
+    fans     = load_fans()
+    accounts = await asyncio.to_thread(get_all_accounts)
+    default_acc = accounts[0]["id"] if accounts else ""
+
+    now     = datetime.now()
+    today_s = now.strftime("%Y-%m-%d")
+
+    candidates: list[tuple[str, dict, int, float]] = []
+    for fan_id, fan_data in fans.items():
+        if fan_data.get("blocked") or fan_data.get("auto_stopped"):
+            continue
+        total_spent = float(fan_data.get("total_spent") or fan_data.get("payment_total") or 0)
+        if total_spent <= 0:
+            continue
+        if int(fan_data.get("daily_message_count", 0)) > 0:
+            continue
+        if fan_data.get("last_reply_date") == today_s:
+            continue
+        last_msg_dt = parse_dt(fan_data.get("last_message_date"))
+        if not last_msg_dt:
+            continue
+        days_silent = (now - last_msg_dt).days
+        if days_silent < 3:
+            continue
+        candidates.append((fan_id, fan_data, days_silent, total_spent))
+
+    candidates.sort(key=lambda x: x[3], reverse=True)
+    top5 = candidates[:5]
+
+    if not top5:
+        logger.info("nightdrive: no candidates tonight")
+        return
+
+    await send_nightdrive_message(app.bot, f"🌙 Ночной дожим — {len(top5)} фанов")
+
+    for fan_id, fan_data, days_silent, total_spent in top5:
+        profile  = fan_data.get("profile", {})
+        dname    = _clean(fan_display_name(fan_id, fan_data))
+        acc_id   = fan_data.get("account_id") or default_acc
+
+        profile_lines: list[str] = []
+        if profile.get("name"):
+            profile_lines.append(f"Name: {_clean(profile['name'])}")
+        if profile.get("fetishes"):
+            profile_lines.append(f"Fetishes: {_clean(', '.join(str(f) for f in profile['fetishes']))}")
+        if profile.get("chat_style"):
+            profile_lines.append(f"Chat style: {_clean(str(profile['chat_style']))}")
+        if profile.get("notes"):
+            profile_lines.append(f"Notes: {_clean(str(profile['notes']))}")
+        profile_text = "\n".join(profile_lines) or "No profile data"
+
+        prompt = _NIGHTDRIVE_PROMPT.format(
+            style_prefix=_style_prefix(),
+            profile_text=profile_text,
+            total_spent=total_spent,
+            days_silent=days_silent,
+        )
+
+        try:
+            text = await asyncio.to_thread(claude_client.chat, prompt)
+            text = text.strip().strip('"')
+        except Exception as e:
+            logger.warning("nightdrive: Claude failed for %s: %s", fan_id, e)
+            text = "Hey, was just thinking about you 💕"
+
+        reason = f"Молчит {days_silent} дн, потратил ${total_spent:.0f}"
+
+        msg_text = (
+            f"🌙 Ночной дожим — {dname}\n"
+            f"💰 ${total_spent:.0f} за всё время • Молчит {days_silent} дней\n"
+            f"🎯 Причина: {reason}\n\n"
+            f'✍️ Предлагаемое сообщение:\n"{text}"'
+        )
+        markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Отправить",     callback_data=f"nd_send:{fan_id}"),
+            InlineKeyboardButton("✏️ Редактировать", callback_data=f"nd_edit:{fan_id}"),
+        ]])
+
+        _nd_texts[fan_id] = {"text": text, "account_id": acc_id, "dname": dname}
+
+        await send_nightdrive_message(app.bot, msg_text, reply_markup=markup)
+        await asyncio.sleep(0.5)
+
+    logger.info("nightdrive: posted %d cards", len(top5))
+
+
+async def handle_nd_send(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global _nd_sent_tonight, _nd_last_sent
+
+    query  = update.callback_query
+    fan_id = query.data.split(":", 1)[1]
+    logger.info("nd_send button: fan_id=%s", fan_id)
+
+    # Wrap query.answer() — it throws BadRequest if the query is expired (>60s old)
+    async def _safe_answer(text: str = "", show_alert: bool = False) -> bool:
+        try:
+            await query.answer(text, show_alert=show_alert)
+            return True
+        except Exception as ex:
+            logger.warning("nd_send: query.answer failed (expired?): %s", ex)
+            return False
+
+    state = _nd_texts.get(fan_id)
+    if not state:
+        logger.warning("nd_send: no state for fan_id=%s (keys: %s)", fan_id, list(_nd_texts.keys()))
+        answered = await _safe_answer("❌ Данные устарели, запусти /nightdrive заново", show_alert=True)
+        if not answered:
+            try:
+                await query.message.reply_text("❌ Данные устарели, запусти /nightdrive заново")
+            except Exception:
+                pass
+        return
+
+    if is_stopped():
+        await _safe_answer("🛑 Отправки остановлены (/resume_all)", show_alert=True)
+        return
+
+    if _nd_sent_tonight >= 5:
+        await _safe_answer("🚫 Лимит 5 сообщений за ночь исчерпан", show_alert=True)
+        return
+
+    now = datetime.now()
+    if _nd_last_sent and (now - _nd_last_sent).total_seconds() < 600:
+        remaining = int(600 - (now - _nd_last_sent).total_seconds())
+        await _safe_answer(f"⏱ Подожди ещё {remaining // 60}м {remaining % 60}с", show_alert=True)
+        return
+
+    # All checks passed — dismiss spinner
+    await _safe_answer()
+
+    delay      = random.randint(3, 15)
+    text       = state["text"]
+    account_id = state["account_id"]
+    dname      = state["dname"]
+
+    logger.info("nd_send: fan=%s acc=%s delay=%dm text=%r", fan_id, account_id, delay, text[:80])
+
+    # Immediately edit card to show pending status (removes buttons)
+    try:
+        await query.message.edit_text(
+            f"🌙 Ночной дожим — {dname}\n"
+            f"⏳ Отправляю через {delay} мин...\n\n"
+            f'✍️ "{text[:200]}"'
+        )
+    except Exception as ex:
+        logger.warning("nd_send: edit_text failed: %s", ex)
+        try:
+            await query.message.reply_text(f"⏳ Отправляю для {dname} через {delay} мин...")
+        except Exception:
+            pass
+
+    asyncio.create_task(_do_nd_send(
+        app=context.application,
+        fan_id=fan_id,
+        account_id=account_id,
+        text=text,
+        dname=dname,
+        orig_msg=query.message,
+        delay_mins=delay,
+        edited=False,
+    ))
+
+
+async def handle_nd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query  = update.callback_query
+    fan_id = query.data.split(":", 1)[1]
+    logger.info("nd_edit button: fan_id=%s", fan_id)
+
+    state = _nd_texts.get(fan_id)
+    if not state:
+        try:
+            await query.answer("❌ Данные устарели, запусти /nightdrive заново", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    try:
+        await query.answer()
+    except Exception as ex:
+        logger.warning("nd_edit: query.answer failed (expired?): %s", ex)
+
+    dname      = state["dname"]
+    account_id = state["account_id"]
+
+    # Send prompt and key pending by the prompt message ID
+    # (bots always receive replies to their own messages — works even with privacy mode)
+    prompt_msg = await send_nightdrive_message(
+        context.bot,
+        f"✏️ Ответь на это сообщение своим текстом для {dname} — отправлю с задержкой 3–15 мин"
+    )
+    if not prompt_msg:
+        await query.message.reply_text("❌ Не могу отправить сообщение-подсказку")
+        return
+
+    logger.info("nd_edit: prompt_msg_id=%d fan=%s acc=%s", prompt_msg.message_id, fan_id, account_id)
+    _nd_edit_pending[prompt_msg.message_id] = {
+        "fan_id":     fan_id,
+        "account_id": account_id,
+        "dname":      dname,
+        "orig_msg":   query.message,
+    }
+
+
+async def handle_nd_custom_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Catch a reply to the nightdrive edit-prompt message and use it as custom send text."""
+    msg = update.message
+    if not msg or not msg.text or not msg.reply_to_message:
+        return
+
+    reply_to_id = msg.reply_to_message.message_id
+    logger.info(
+        "nd_custom_text: reply_to=%d pending_ids=%s text=%r",
+        reply_to_id, list(_nd_edit_pending.keys()), msg.text[:60],
+    )
+
+    pending = _nd_edit_pending.pop(reply_to_id, None)
+    if not pending:
+        return
+
+    fan_id     = pending["fan_id"]
+    account_id = pending["account_id"]
+    dname      = pending["dname"]
+    orig_msg   = pending["orig_msg"]
+    text       = msg.text.strip()
+
+    logger.info("nd_custom_text: using custom text for fan=%s: %r", fan_id, text[:80])
+
+    if is_stopped():
+        await msg.reply_text("🛑 Отправки остановлены (/resume_all)")
+        return
+
+    if _nd_sent_tonight >= 5:
+        await msg.reply_text("🚫 Лимит 5 сообщений за ночь исчерпан")
+        return
+
+    delay = random.randint(3, 15)
+    await msg.reply_text(f"⏳ Отправлю для {dname} через {delay} мин...")
+
+    asyncio.create_task(_do_nd_send(
+        app=context.application,
+        fan_id=fan_id,
+        account_id=account_id,
+        text=text,
+        dname=dname,
+        orig_msg=orig_msg,
+        delay_mins=delay,
+        edited=True,
+    ))
+
+
+async def _reset_daily_message_counts() -> None:
+    fans = load_fans()
+    for fid in fans:
+        fans[fid]["daily_message_count"] = 0
+    save_fans(fans)
+    logger.info("nightdrive: reset daily_message_count for %d fans", len(fans))
+
+
+async def cmd_nightdrive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Manual nightdrive trigger for testing."""
+    msg = await update.message.reply_text("🌙 Запускаю ночной дожим...")
+    try:
+        await _run_nightdrive(context.application)
+        await msg.edit_text("🌙 Ночной дожим запущен — карточки отправлены в топик")
+    except Exception as e:
+        logger.exception("cmd_nightdrive failed")
+        await msg.edit_text(f"❌ Ошибка: {e}")
+
+
+async def cmd_stop_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    save_bot_status({"stop_all": True})
+    await update.message.reply_text("🛑 Все авто-отправки остановлены")
+
+
+async def cmd_resume_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    save_bot_status({"stop_all": False})
+    await update.message.reply_text("✅ Авто-отправки возобновлены")
+
+
+async def cmd_sent_log(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    log = load_sent_log()
+    if not log:
+        await update.message.reply_text("📭 Лог пуст — ещё ничего не отправлено")
+        return
+    last10 = log[-10:]
+    lines = ["📋 Последние 10 отправленных:\n"]
+    for e in reversed(last10):
+        date  = e.get("date", "")[:16].replace("T", " ")
+        name  = e.get("fan_name", e.get("fan_id", "?"))
+        text  = e.get("text", "")[:60]
+        edited = " (ред.)" if e.get("edited") else ""
+        lines.append(f"• {date}{edited} — {name}\n  {text}")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_stoplist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    fans = load_fans()
+    stopped = [
+        (fid, fd) for fid, fd in fans.items() if fd.get("auto_stopped")
+    ]
+    if not stopped:
+        await update.message.reply_text("✅ Стоп-лист пуст")
+        return
+    lines = [f"🚫 Стоп-лист ({len(stopped)} фанов):\n"]
+    for fid, fd in stopped:
+        name  = fan_display_name(fid, fd)
+        spent = float(fd.get("total_spent") or fd.get("payment_total") or 0)
+        lines.append(f"• {name} — ${spent:.0f}")
+    await update.message.reply_text("\n".join(lines))
+
+
+# ─── /ask ─────────────────────────────────────────────────────────────────────
+
+_ASK_PROMPT = """\
+Ты — эксперт по монетизации OnlyFans. Отвечай строго на русском, конкретно, 3-5 предложений.
+
+ДОСЬЕ ФАНА ({dname}):
+{profile_text}
+
+ПОСЛЕДНИЕ СООБЩЕНИЯ (от новых к старым):
+{messages_text}
+
+ВОПРОС МЕНЕДЖЕРА:
+{question}
+
+Дай конкретный совет основанный на данных выше. Без воды, без общих слов.
+"""
+
+
+async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = context.args
+    if not args or len(args) < 2:
+        await update.message.reply_text(
+            "Использование: /ask [fan_id] [вопрос]\n"
+            "Пример: /ask 12345 как лучше предложить ему PPV сейчас?"
+        )
+        return
+
+    fan_id   = args[0]
+    question = " ".join(args[1:])
+
+    fans     = load_fans()
+    fan_data = fans.get(fan_id, {})
+    if not fan_data:
+        await update.message.reply_text(f"❌ Фан {fan_id} не найден в базе")
+        return
+
+    dname    = fan_display_name(fan_id, fan_data)
+    msg      = await update.message.reply_text(f"🤖 Читаю чат с {dname}...")
+
+    # Get last 20 messages
+    accounts = await asyncio.to_thread(get_all_accounts)
+    acc_id   = fan_data.get("account_id") or (accounts[0]["id"] if accounts else "")
+    chat_lines: list[str] = []
+    if acc_id:
+        try:
+            msgs = await asyncio.wait_for(
+                asyncio.to_thread(om_client.get_messages, acc_id, fan_id, 20),
+                timeout=15,
+            )
+            for m in msgs:
+                who  = "Модель" if m.get("is_sent_by_me") else "Фан"
+                text = _clean(_TAG.sub("", str(m.get("text") or ""))).strip()
+                if text:
+                    chat_lines.append(f"{who}: {text[:200]}")
+        except Exception as e:
+            logger.warning("cmd_ask: get_messages: %s", e)
+
+    # Build profile text
+    profile = fan_data.get("profile", {})
+    prof_parts: list[str] = []
+    if profile.get("name"):
+        prof_parts.append(f"Имя: {_clean(profile['name'])}")
+    total_spent = float(fan_data.get("total_spent") or fan_data.get("payment_total") or 0)
+    prof_parts.append(f"Потратил: ${total_spent:.0f}")
+    last_msg = fan_data.get("last_message_date", "")
+    if last_msg:
+        days = (datetime.now() - (parse_dt(last_msg) or datetime.now())).days
+        prof_parts.append(f"Молчит: {days} дн")
+    if profile.get("fetishes"):
+        prof_parts.append(f"Фетиши: {_clean(', '.join(str(f) for f in profile['fetishes']))}")
+    if profile.get("chat_style"):
+        prof_parts.append(f"Стиль общения: {_clean(str(profile['chat_style']))}")
+    if profile.get("notes"):
+        prof_parts.append(f"Заметки: {_clean(str(profile['notes']))}")
+
+    prompt = _ASK_PROMPT.format(
+        dname         = dname,
+        profile_text  = "\n".join(prof_parts) or "нет данных",
+        messages_text = "\n".join(chat_lines) or "нет сообщений",
+        question      = question,
+    )
+
+    try:
+        await msg.edit_text(f"🤖 Анализирую...")
+        answer = await asyncio.to_thread(claude_client.chat, prompt)
+        await msg.edit_text(f"🤖 Анализ {dname}:\n\n{answer}")
+    except Exception as e:
+        logger.exception("cmd_ask failed")
+        await msg.edit_text(f"❌ Ошибка: {e}")
+
+
+# ─── BROADCAST ANALYTICS ──────────────────────────────────────────────────────
+
+async def detect_broadcasts(days: int = 7,
+                            prefetched_txns: list[dict] | None = None) -> list[dict]:
+    """
+    Scan outgoing messages for all fans over the last `days` days.
+    Groups messages by text — groups with 3+ recipients = broadcast.
+    Returns list sorted by most recent first, with reply + revenue stats.
+    Pass prefetched_txns to skip the transaction API call (avoids double fetch in weekly report).
+    """
+    fans     = load_fans()
+    accounts = await asyncio.to_thread(get_all_accounts)
+    default_acc = accounts[0]["id"] if accounts else ""
+    since = datetime.now() - timedelta(days=days)
+
+    # Fetch messages for all fans (max 5 concurrent to avoid hammering API)
+    fan_messages: dict[str, list[dict]] = {}
+    sem = asyncio.Semaphore(5)
+
+    async def _fetch(fan_id: str, fdata: dict) -> None:
+        async with sem:
+            acc_id = fdata.get("account_id") or default_acc
+            if not acc_id:
+                return
+            try:
+                msgs = await asyncio.wait_for(
+                    asyncio.to_thread(om_client.get_messages, acc_id, fan_id, 100),
+                    timeout=12,
+                )
+                fan_messages[fan_id] = msgs if isinstance(msgs, list) else []
+            except Exception as e:
+                logger.warning("detect_broadcasts: fan %s: %s", fan_id, e)
+
+    await asyncio.gather(*[_fetch(fid, fd) for fid, fd in fans.items()])
+
+    # Use prefetched transactions or fetch fresh
+    if prefetched_txns is not None:
+        all_txns = prefetched_txns
+    else:
+        all_txns = []
+        for acct in accounts:
+            plat_acc = acct.get("platform_account_id", "")
+            if not plat_acc:
+                continue
+            try:
+                batch = await asyncio.wait_for(
+                    asyncio.to_thread(om_client.get_all_transactions_paged, plat_acc, days),
+                    timeout=60,
+                )
+                all_txns.extend(batch)
+            except Exception as e:
+                logger.warning("detect_broadcasts: txns %s: %s", plat_acc, e)
+
+    # Build txn lookup: fan_id → [(datetime, amount)]
+    txn_lookup: dict[str, list[tuple]] = {}
+    for txn in all_txns:
+        fid = str((txn.get("fan") or {}).get("id") or "")
+        amt = float(txn.get("amount") or 0)
+        ts_str = txn.get("timestamp") or txn.get("created_at")
+        if fid and amt > 0 and ts_str:
+            dt = parse_dt(str(ts_str))
+            if dt:
+                txn_lookup.setdefault(fid, []).append((dt, amt))
+
+    # Group outgoing messages by text (first 120 chars, lowercase)
+    text_groups: dict[str, dict] = {}
+    for fan_id, msgs in fan_messages.items():
+        for m in msgs:
+            if not m.get("is_sent_by_me"):
+                continue
+            text = (m.get("text") or "").strip()
+            if not text:
+                continue
+            ts = parse_dt(m.get("created_at") or m.get("timestamp") or "")
+            if not ts or ts < since:
+                continue
+            key = text[:120].lower().strip()
+            if key not in text_groups:
+                text_groups[key] = {"text": text, "fans": {}, "earliest": ts}
+            grp = text_groups[key]
+            if fan_id not in grp["fans"] or ts < grp["fans"][fan_id]:
+                grp["fans"][fan_id] = ts
+            if ts < grp["earliest"]:
+                grp["earliest"] = ts
+
+    # Build results for groups with 3+ recipients
+    results = []
+    for grp in text_groups.values():
+        n = len(grp["fans"])
+        if n < 3:
+            continue
+
+        replied = 0
+        revenue = 0.0
+        for fan_id, sent_ts in grp["fans"].items():
+            # Reply: any incoming message after broadcast was sent
+            msgs_all = fan_messages.get(fan_id, [])
+            if any(
+                not m.get("is_sent_by_me") and
+                (parse_dt(m.get("created_at") or m.get("timestamp") or "") or datetime.min) > sent_ts
+                for m in msgs_all
+            ):
+                replied += 1
+            # Revenue: any purchase after broadcast
+            for txn_ts, amt in txn_lookup.get(fan_id, []):
+                if txn_ts > sent_ts:
+                    revenue += amt
+
+        results.append({
+            "text":       grp["text"][:300],
+            "sent_at":    grp["earliest"].isoformat(),
+            "recipients": n,
+            "replied":    replied,
+            "revenue":    revenue,
+        })
+
+    results.sort(key=lambda x: x["sent_at"], reverse=True)
+    logger.info("detect_broadcasts: %d broadcasts detected across %d fans", len(results), len(fans))
+    return results
+
+
+async def cmd_broadcasts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Detect and show broadcasts sent by chatters over the last 7 days."""
+    days = 7
+    if context.args:
+        try:
+            days = int(context.args[0])
+        except ValueError:
+            pass
+
+    msg = await update.message.reply_text(f"🔍 Сканирую рассылки за {days} дней...")
+    try:
+        results = await detect_broadcasts(days=days)
+        if not results:
+            await msg.edit_text(
+                f"📭 Рассылок не найдено за {days} дней\n"
+                "(нет одинакового текста у 3+ фанов)"
+            )
+            return
+
+        lines = [f"📢 Рассылки за {days} дней — {len(results)} шт.\n"]
+        for i, b in enumerate(results[:10], 1):
+            n    = b["recipients"]
+            r    = b["replied"]
+            rate = f"{r/n*100:.0f}%" if n else "0%"
+            dt   = b["sent_at"][:16].replace("T", " ")
+            lines.append(
+                f"{i}. «{b['text'][:80]}»\n"
+                f"   📅 {dt}  👥 {n} фанов  💬 {r} ответов ({rate})  💰 ${b['revenue']:.0f}\n"
+            )
+
+        result_text = "\n".join(lines)
+        await msg.edit_text(result_text)
+        await send_broadcasts_message(context.bot, result_text)
+    except Exception as e:
+        logger.exception("cmd_broadcasts failed")
+        await msg.edit_text(f"❌ Ошибка: {e}")
+
+
 # ─── BUTTON HANDLER ───────────────────────────────────────────────────────────
 
 async def handle_get_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1517,6 +3044,7 @@ async def handle_get_text(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     no_comp = f" Never mention {comp} or any competing platform." if comp else ""
 
     prompt = (
+        f"{_style_prefix()}"
         f"You are a chatter working for a creator on {plabel}.{no_comp}\n"
         f"Write a personal message to a fan on behalf of the creator.\n\n"
         f"Fan profile:\n{profile_text}\n\n"
@@ -2076,6 +3604,44 @@ async def cmd_analyze_paying(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
+async def cmd_transaction_types(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Fetch last 100 transactions and show all unique type values."""
+    msg = await update.message.reply_text("⏳ Запрашиваю транзакции...")
+    try:
+        accounts = await asyncio.to_thread(get_all_accounts)
+        type_counts: dict[str, int] = {}
+        type_examples: dict[str, float] = {}
+
+        for acct in accounts:
+            plat_acc = acct.get("platform_account_id", "")
+            if not plat_acc:
+                continue
+            resp = await asyncio.wait_for(
+                asyncio.to_thread(om_client.get_transactions, plat_acc, limit=100),
+                timeout=30,
+            )
+            txns = resp.get("items") or resp.get("transactions") or resp.get("data") or []
+            for txn in txns:
+                t = str(txn.get("type") or "(пусто)")
+                amt = float(txn.get("amount") or 0)
+                type_counts[t] = type_counts.get(t, 0) + 1
+                if t not in type_examples:
+                    type_examples[t] = amt
+
+        if not type_counts:
+            await msg.edit_text("❌ Транзакций не найдено")
+            return
+
+        lines = ["<b>Уникальные типы транзакций (последние 100):</b>\n"]
+        for t, cnt in sorted(type_counts.items(), key=lambda x: -x[1]):
+            lines.append(f"• <code>{_html.escape(t)}</code> — {cnt} шт, пример: ${type_examples[t]:.2f}")
+        await msg.edit_text("\n".join(lines), parse_mode="HTML")
+
+    except Exception as e:
+        logger.exception("cmd_transaction_types failed")
+        await msg.edit_text(f"❌ Ошибка: {e}")
+
+
 async def cmd_transactions_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Dump raw transactions for a platform_account_id and show top-5 payers."""
     plat_acc = context.args[0] if context.args else "435481099"
@@ -2158,6 +3724,266 @@ async def cmd_nick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     logger.info("cmd_nick: fan %s → custom_name=%s", fan_id, custom_name)
     await update.message.reply_text(f"✅ Фан {fan_id} теперь называется <b>{custom_name}</b>", parse_mode="HTML")
+
+
+# ─── WEBHOOK / ALERTS ─────────────────────────────────────────────────────────
+
+# fan_id → datetime of last unanswered fan message
+_unanswered: dict[str, datetime] = {}
+# fan_id → already alerted for this unanswered stretch (cleared on reply)
+_alerted_unanswered: set[str] = set()
+
+_HOT_WORDS = frozenset({
+    "how much", "price", "cost", "buy", "want", "purchase",
+    "how can i", "can i get",
+})
+
+
+def _wh_verify(raw_body: bytes, timestamp: str, signature: str, secret: str) -> bool:
+    msg = f"{timestamp}.{raw_body.decode('utf-8', errors='replace')}"
+    expected = hmac.new(secret.encode(), msg.encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+
+def _wh_extract(payload: dict) -> tuple[str, str, dict]:
+    """Return (fan_id, account_id, message_dict) from any webhook shape."""
+    data    = payload.get("data") or payload
+    fan_id  = str(
+        data.get("fan_id") or
+        (data.get("fan") or {}).get("id") or
+        payload.get("fan_id") or ""
+    )
+    acc_id  = str(
+        data.get("account_id") or payload.get("account_id") or ""
+    )
+    msg     = data.get("message") or data
+    return fan_id, acc_id, msg
+
+
+async def _alert_level2_vip(bot, fan_id: str, fan_data: dict, acc_id: str, text: str) -> None:
+    profile = fan_data.get("profile", {})
+    dname   = _clean(fan_display_name(fan_id, fan_data))
+    total   = float(fan_data.get("total_spent") or fan_data.get("payment_total") or 0)
+
+    try:
+        msgs = await asyncio.wait_for(
+            asyncio.to_thread(om_client.get_messages, acc_id, fan_id, 10),
+            timeout=15,
+        )
+    except Exception:
+        msgs = []
+
+    conv = "\n".join(
+        f"{'Фан' if not m.get('is_sent_by_me') else 'Модель'}: "
+        f"{_clean(_TAG.sub('', str(m.get('text') or ''))).strip()[:120]}"
+        for m in msgs if (m.get("text") or "").strip()
+    ) or "нет диалога"
+
+    style = _style_prefix()
+    prompt = (
+        f"{style}"
+        f"VIP фан написал (потратил ${total:.0f}).\n"
+        f"Фетиши: {', '.join(str(f) for f in profile.get('fetishes', [])) or 'неизвестно'}\n"
+        f"Стиль: {profile.get('chat_style') or 'нет данных'}\n\n"
+        f"Последние сообщения:\n{conv}\n\n"
+        f"Его сообщение: {text or '(без текста)'}\n\n"
+        "Дай 1-2 предложения на русском: что предложить этому VIP прямо сейчас? "
+        "Если есть style guide — подскажи конкретную фразу в стиле модели."
+    )
+    try:
+        advice = await asyncio.to_thread(claude_client.chat, prompt)
+        await send_alerts_message(
+            bot,
+            f"⚡️ VIP написал — {dname}\n"
+            f"💰 ${total:.0f} за всё время • 🔥 {_stars(profile.get('warmth'))} • "
+            f"👁 {_stars(profile.get('engagement'))}\n"
+            f"🤖 Совет: {advice}\n"
+            f"👤 /fan {fan_id}",
+        )
+    except Exception:
+        logger.exception("_alert_level2_vip Claude failed fan=%s", fan_id)
+
+
+async def _alert_level2_purchase(bot, fan_id: str, fan_data: dict, amount: float) -> None:
+    profile = fan_data.get("profile", {})
+    dname   = _clean(fan_display_name(fan_id, fan_data))
+    total   = float(fan_data.get("total_spent") or fan_data.get("payment_total") or 0)
+
+    style = _style_prefix()
+    prompt = (
+        f"{style}"
+        f"Фан только что купил контент на ${amount:.0f} (итого потратил ${total:.0f}).\n"
+        f"Фетиши: {', '.join(str(f) for f in profile.get('fetishes', [])) or 'неизвестно'}\n"
+        f"Стиль: {profile.get('chat_style') or 'нет данных'}\n\n"
+        "Дай 1 предложение на русском: что предложить следующим шагом? "
+        "Если есть style guide — используй конкретную фразу в стиле модели."
+    )
+    try:
+        advice = await asyncio.to_thread(claude_client.chat, prompt)
+        await send_alerts_message(
+            bot,
+            f"💸 Купил! — {dname}\n"
+            f"💰 Покупка: ${amount:.0f} • Всего: ${total:.0f}\n"
+            f"🤖 Следующий шаг: {advice}\n"
+            f"👤 /fan {fan_id}",
+        )
+    except Exception:
+        logger.exception("_alert_level2_purchase Claude failed fan=%s", fan_id)
+
+
+async def _alert_level2_hot_words(bot, fan_id: str, fan_data: dict, text: str) -> None:
+    profile = fan_data.get("profile", {})
+    dname   = _clean(fan_display_name(fan_id, fan_data))
+
+    style = _style_prefix()
+    prompt = (
+        f"{style}"
+        f"Фан написал: \"{text}\"\n"
+        f"Фетиши: {', '.join(str(f) for f in profile.get('fetishes', [])) or 'неизвестно'}\n"
+        f"Стиль: {profile.get('chat_style') or 'нет данных'}\n\n"
+        "Дай 1 предложение на русском: что конкретно предложить и по какой цене? "
+        "Если есть style guide — приведи пример фразы в стиле модели."
+    )
+    try:
+        advice = await asyncio.to_thread(claude_client.chat, prompt)
+        await send_alerts_message(
+            bot,
+            f"🎯 Готов покупать — {dname}\n"
+            f"💬 Написал: \"{_clean(text[:120])}\"\n"
+            f"🤖 Предложи: {advice}\n"
+            f"👤 /fan {fan_id}",
+        )
+    except Exception:
+        logger.exception("_alert_level2_hot_words Claude failed fan=%s", fan_id)
+
+
+async def _process_webhook(app: "Application", payload: dict) -> None:
+    try:
+        event          = str(payload.get("event") or payload.get("type") or "")
+        fan_id, acc_id, msg = _wh_extract(payload)
+
+        logger.info("Webhook event=%r fan=%s acc=%s", event, fan_id, acc_id)
+
+        is_purchase_event = event in ("transaction", "purchase", "chat.purchase")
+        is_message_event  = not is_purchase_event  # treat anything else as potential message
+
+        fans     = load_fans()
+        fan_data = fans.get(fan_id, {})
+
+        # ── Purchase event ──────────────────────────────────────────────────
+        if is_purchase_event:
+            amount = float(
+                payload.get("amount") or msg.get("price") or msg.get("amount") or 0
+            )
+            if amount > 0 and fan_id:
+                asyncio.create_task(_alert_level2_purchase(app.bot, fan_id, fan_data, amount))
+            return
+
+        # ── Message event ───────────────────────────────────────────────────
+        if not fan_id:
+            return
+
+        is_from_fan = not bool(msg.get("is_sent_by_me", False))
+        text        = _clean(_TAG.sub("", str(msg.get("text") or ""))).strip()
+        price       = float(msg.get("price") or 0)
+        is_free     = bool(msg.get("is_free", True))
+        now         = datetime.now()
+
+        if is_from_fan:
+            # Level 1 — new fan
+            if not fan_data:
+                await send_alerts_message(
+                    app.bot,
+                    f"🆕 Новый фан написал!\nfan_id: {fan_id}\n👤 /analyze {fan_id}",
+                )
+                logger.info("Alert: new fan %s", fan_id)
+
+            # Level 1 — returned after 5+ days
+            last_msg_dt = parse_dt(fan_data.get("last_message_date"))
+            if last_msg_dt:
+                days_silent = (now - last_msg_dt).days
+                if days_silent >= 5:
+                    dname = _clean(fan_display_name(fan_id, fan_data))
+                    total = float(fan_data.get("total_spent") or fan_data.get("payment_total") or 0)
+                    await send_alerts_message(
+                        app.bot,
+                        f"🔄 Вернулся после {days_silent} дн — {dname}\n"
+                        f"💰 ${total:.0f} за всё время\n"
+                        f"👤 /fan {fan_id}",
+                    )
+                    logger.info("Alert: fan %s returned after %d days", fan_id, days_silent)
+
+            # Track unanswered
+            _unanswered[fan_id] = now
+            _alerted_unanswered.discard(fan_id)
+
+            # Level 2 — VIP
+            total = float(fan_data.get("total_spent") or fan_data.get("payment_total") or 0)
+            if total >= 300 and fan_data.get("profile"):
+                asyncio.create_task(_alert_level2_vip(app.bot, fan_id, fan_data, acc_id, text))
+
+            # Level 2 — hot words
+            if text and any(hw in text.lower() for hw in _HOT_WORDS):
+                asyncio.create_task(_alert_level2_hot_words(app.bot, fan_id, fan_data, text))
+
+            # Level 2 — paid message received (fan bought PPV)
+            if price > 0 and not is_free:
+                asyncio.create_task(_alert_level2_purchase(app.bot, fan_id, fan_data, price))
+
+            # Update last_message_date
+            fan_data["last_message_date"] = now.isoformat()
+            fans[fan_id] = fan_data
+            save_fans(fans)
+
+        else:
+            # Model replied → clear unanswered state
+            _unanswered.pop(fan_id, None)
+            _alerted_unanswered.discard(fan_id)
+
+    except Exception:
+        logger.exception("_process_webhook error, payload: %s", payload)
+
+
+async def webhook_handler(request: web.Request) -> web.Response:
+    raw = await request.read()
+    secret = os.getenv("WEBHOOK_SECRET", "")
+    if secret and secret != "СЮДА_ВСТАВИШЬ_СЕКРЕТ":
+        sig = request.headers.get("x-om-webhook-signature", "")
+        ts  = request.headers.get("x-om-webhook-timestamp", "")
+        if not sig or not _wh_verify(raw, ts, sig, secret):
+            logger.warning("Webhook: bad signature from %s", request.remote)
+            return web.Response(status=401, text="Unauthorized")
+
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return web.Response(status=400, text="Bad JSON")
+
+    app = request.app["tg_app"]
+    asyncio.create_task(_process_webhook(app, payload))
+    return web.Response(status=200, text="OK")
+
+
+async def _poll_unanswered_loop(app: "Application") -> None:
+    """Every 30 min: alert if a fan's message has gone unanswered for 45+ minutes."""
+    while True:
+        await asyncio.sleep(30 * 60)
+        now  = datetime.now()
+        fans = load_fans()
+        for fan_id, since in list(_unanswered.items()):
+            waited_min = (now - since).total_seconds() / 60
+            if waited_min >= 45 and fan_id not in _alerted_unanswered:
+                _alerted_unanswered.add(fan_id)
+                fan_data = fans.get(fan_id, {})
+                dname    = _clean(fan_display_name(fan_id, fan_data))
+                total    = float(fan_data.get("total_spent") or fan_data.get("payment_total") or 0)
+                await send_alerts_message(
+                    app.bot,
+                    f"⏰ Ждёт ответа {int(waited_min)} мин\n"
+                    f"{dname} • 💰 ${total:.0f} за всё время\n"
+                    f"👤 /fan {fan_id}",
+                )
+                logger.info("Alert: fan %s unanswered %.0f min", fan_id, waited_min)
 
 
 # ─── CHATTERS ──────────────────────────────────────────────────────────────────
@@ -2336,12 +4162,12 @@ async def _run_chatter_report_scheduled(app: Application) -> None:
     logger.info("Scheduled chatter report started")
     try:
         now_msk   = datetime.now(TZ_MSK).replace(tzinfo=None)
-        yesterday = (now_msk - timedelta(days=1)).date()
-        msk_start = datetime(yesterday.year, yesterday.month, yesterday.day, 0, 0, 0)
-        msk_end   = msk_start + timedelta(days=1, microseconds=-1)
+        msk_end   = now_msk
+        msk_start = msk_end - timedelta(hours=24)
         chatters  = load_chatters()
         accounts  = await asyncio.to_thread(get_all_accounts)
-        label     = f"Отчёт за вчера ({yesterday.strftime('%d.%m.%Y')})"
+        label     = (f"Отчёт за 24ч "
+                     f"({msk_start.strftime('%d.%m %H:%M')} — {msk_end.strftime('%d.%m %H:%M')} МСК)")
         text = await build_chatter_report(msk_start, msk_end, chatters, accounts, label)
         await send_chatters_message(app.bot, text)
         logger.info("Scheduled chatter report sent")
@@ -2350,15 +4176,15 @@ async def _run_chatter_report_scheduled(app: Application) -> None:
 
 
 async def cmd_chatter_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = await update.message.reply_text("⏳ Формирую отчёт за вчера...")
+    msg = await update.message.reply_text("⏳ Формирую отчёт за последние 24ч...")
     try:
         now_msk   = datetime.now(TZ_MSK).replace(tzinfo=None)
-        yesterday = (now_msk - timedelta(days=1)).date()
-        msk_start = datetime(yesterday.year, yesterday.month, yesterday.day, 0, 0, 0)
-        msk_end   = msk_start + timedelta(days=1, microseconds=-1)
+        msk_end   = now_msk
+        msk_start = msk_end - timedelta(hours=24)
         chatters  = load_chatters()
         accounts  = await asyncio.to_thread(get_all_accounts)
-        label     = f"Отчёт за вчера ({yesterday.strftime('%d.%m.%Y')})"
+        label     = (f"Отчёт за 24ч "
+                     f"({msk_start.strftime('%d.%m %H:%M')} — {msk_end.strftime('%d.%m %H:%M')} МСК)")
         text = await build_chatter_report(msk_start, msk_end, chatters, accounts, label)
         await msg.edit_text(text)
     except Exception as e:
@@ -2370,14 +4196,12 @@ async def cmd_chatter_report_week(update: Update, context: ContextTypes.DEFAULT_
     msg = await update.message.reply_text("⏳ Формирую отчёт за 7 дней...")
     try:
         now_msk   = datetime.now(TZ_MSK).replace(tzinfo=None)
-        yesterday = (now_msk - timedelta(days=1)).date()
-        week_ago  = (now_msk - timedelta(days=7)).date()
-        msk_start = datetime(week_ago.year,   week_ago.month,   week_ago.day,   0,  0,  0)
-        msk_end   = datetime(yesterday.year, yesterday.month, yesterday.day, 23, 59, 59)
+        msk_end   = now_msk
+        msk_start = msk_end - timedelta(days=7)
         chatters  = load_chatters()
         accounts  = await asyncio.to_thread(get_all_accounts)
         label = (f"Отчёт за 7 дней "
-                 f"({week_ago.strftime('%d.%m')} — {yesterday.strftime('%d.%m.%Y')})")
+                 f"({msk_start.strftime('%d.%m %H:%M')} — {msk_end.strftime('%d.%m %H:%M')} МСК)")
         text = await build_chatter_report(msk_start, msk_end, chatters, accounts, label)
         await msg.edit_text(text)
     except Exception as e:
@@ -2543,20 +4367,49 @@ async def run() -> None:
     app.add_handler(CommandHandler("recalc_payments",      cmd_recalc_payments))
     app.add_handler(CommandHandler("reanalyze_top",        cmd_reanalyze_top))
     app.add_handler(CommandHandler("transactions_debug",   cmd_transactions_debug))
+    app.add_handler(CommandHandler("transaction_types",    cmd_transaction_types))
     app.add_handler(CommandHandler("report",               cmd_report))
     app.add_handler(CommandHandler("reactivation",         cmd_reactivation))
+    app.add_handler(CommandHandler("weekly",               cmd_weekly))
+    app.add_handler(CommandHandler("learn_style",          cmd_learn_style))
+    app.add_handler(CommandHandler("update_style",         cmd_update_style))
+    app.add_handler(CommandHandler("show_style",           cmd_show_style))
+    app.add_handler(CommandHandler("nightdrive",           cmd_nightdrive))
+    app.add_handler(CommandHandler("stop_all",             cmd_stop_all))
+    app.add_handler(CommandHandler("resume_all",           cmd_resume_all))
+    app.add_handler(CommandHandler("sent_log",             cmd_sent_log))
+    app.add_handler(CommandHandler("stoplist",             cmd_stoplist))
+    app.add_handler(CommandHandler("ask",                  cmd_ask))
+    app.add_handler(CommandHandler("broadcasts",           cmd_broadcasts))
     app.add_handler(CallbackQueryHandler(handle_get_text,  pattern=r"^get_text:"))
     app.add_handler(CallbackQueryHandler(handle_reactivate, pattern=r"^reactivate:"))
+    app.add_handler(CallbackQueryHandler(handle_nd_send,   pattern=r"^nd_send:"))
+    app.add_handler(CallbackQueryHandler(handle_nd_edit,   pattern=r"^nd_edit:"))
+    # MessageHandler for nightdrive edit replies — catches replies to bot's prompt messages
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.REPLY,
+        handle_nd_custom_text,
+    ))
 
     logger.info(
         "Bot started — daily report %02d:00 MSK, weekly analyze Sun %02d:00 MSK",
         SCHEDULE_HOUR_MSK, SCHEDULE_HOUR_MSK,
     )
 
+    # Start aiohttp webhook server on port 8080
+    wh_app = web.Application()
+    wh_app["tg_app"] = app
+    wh_app.router.add_post("/webhook", webhook_handler)
+    runner = web.AppRunner(wh_app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", 8080).start()
+    logger.info("Webhook server listening on 0.0.0.0:8080")
+
     async with app:
         await app.start()
         await app.updater.start_polling()
         asyncio.create_task(scheduler_loop(app))
+        asyncio.create_task(_poll_unanswered_loop(app))
         await asyncio.Event().wait()
 
 

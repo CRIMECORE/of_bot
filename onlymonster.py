@@ -29,6 +29,27 @@ class OnlyMonsterClient:
                 response.raise_for_status()
             return response.json()
 
+    def _post(self, path: str, json_body: dict,
+              timeout: httpx.Timeout = _TIMEOUT_DEFAULT) -> dict | list:
+        url = f"{BASE_URL}{path}"
+        with httpx.Client(timeout=timeout) as client:
+            response = client.post(url, headers=self.headers, json=json_body, timeout=timeout)
+            if not response.is_success:
+                logger.error(
+                    "OM API POST %s → HTTP %d\nbody: %s",
+                    url, response.status_code, response.text,
+                )
+                response.raise_for_status()
+            return response.json()
+
+    def send_message(self, account_id: str, fan_id: str, text: str) -> dict:
+        """POST /api/v0/accounts/{account_id}/chats/{fan_id}/messages"""
+        path = f"/api/v0/accounts/{account_id}/chats/{fan_id}/messages"
+        logger.info("send_message: POST %s text=%r", path, text[:100])
+        result = self._post(path, {"text": text}, timeout=_TIMEOUT_MESSAGES)
+        logger.info("send_message: response=%s", result)
+        return result
+
     def get_accounts(self) -> list[dict]:
         data = self._get("/api/v0/accounts")
         return data.get("accounts", []) if isinstance(data, dict) else data
