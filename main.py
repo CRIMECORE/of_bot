@@ -3996,7 +3996,7 @@ async def _process_webhook(app: "Application", payload: dict) -> None:
 
 
 async def health_handler(request: web.Request) -> web.Response:
-    return web.Response(status=200, text="OK")
+    return web.Response(status=200, text="healthy")
 
 
 async def webhook_handler(request: web.Request) -> web.Response:
@@ -4530,30 +4530,5 @@ async def run() -> None:
         await asyncio.Event().wait()
 
 
-_PID_FILE = str(Path(os.environ.get("TMPDIR") or os.environ.get("TEMP") or "/tmp") / "ofbot.pid")
-
-
-def _acquire_pid_lock() -> None:
-    if os.path.exists(_PID_FILE):
-        try:
-            with open(_PID_FILE) as f:
-                pid = int(f.read().strip())
-            os.kill(pid, 0)  # raises if process is gone
-            print(f"Bot already running (PID {pid}), exiting.", flush=True)
-            sys.exit(0)
-        except (ValueError, ProcessLookupError):
-            pass  # stale pid file — overwrite below
-        except PermissionError:
-            print(f"Bot already running (PID from {_PID_FILE}), exiting.", flush=True)
-            sys.exit(0)
-
-    with open(_PID_FILE, "w") as f:
-        f.write(str(os.getpid()))
-
-    import atexit
-    atexit.register(lambda: os.path.exists(_PID_FILE) and os.unlink(_PID_FILE))
-
-
 if __name__ == "__main__":
-    _acquire_pid_lock()
     asyncio.run(run())
