@@ -27,6 +27,12 @@ from anthropic_client import AnthropicClient
 
 load_dotenv()
 
+# Удалить старый pid файл при старте
+try:
+    os.remove('/tmp/ofbot.pid')
+except:
+    pass
+
 # ─── CONSTANTS ────────────────────────────────────────────────────────────────
 DAYS_WITHOUT_PURCHASE_ALERT = 3
 DAYS_WITHOUT_REPLY_ALERT    = 2
