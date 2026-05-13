@@ -371,16 +371,19 @@ _AUTO_USERNAME = _re.compile(r"^u\d+$", _re.IGNORECASE)
 
 
 def fan_display_name(fan_id: str, fan_data: dict) -> str:
-    """Priority: custom_name → @realusername → display_name/profile.name → fan_id."""
+    """Priority: custom_name → @realusername → display_name/profile.name → fan_id.
+    Always appends (fan_id) so the ID is visible even when the name is wrong."""
     custom = (fan_data.get("custom_name") or "").strip()
     if custom:
-        return custom
+        return f"{custom} ({fan_id})"
     uname = (fan_data.get("username") or "").strip()
     name  = (fan_data.get("display_name") or
              (fan_data.get("profile") or {}).get("name") or "").strip()
     if uname and not _AUTO_USERNAME.match(uname):
-        return f"@{uname}"
-    return name or str(fan_id)
+        return f"@{uname} ({fan_id})"
+    if name:
+        return f"{name} ({fan_id})"
+    return str(fan_id)
 
 
 def _stars(n, max_n: int = 5) -> str:
@@ -1031,7 +1034,7 @@ def run_monitoring_account(account_id: str, platform: str) -> dict:
         fans.setdefault(fid, {"id": fid})
         fans[fid].update({"account_id": account_id, "platform": platform})
         fan_data = fans[fid]
-        if fan_data.get("blocked"):
+        if fan_data.get("blocked") or fan_data.get("auto_stopped"):
             continue
         profile = fan_data.get("profile") or {}
 
@@ -2222,7 +2225,7 @@ async def cmd_reactivation(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         now  = datetime.now()
         candidates: list[tuple[str, dict, int, float]] = []
         for fan_id, fan_data in fans.items():
-            if fan_data.get("blocked"):
+            if fan_data.get("blocked") or fan_data.get("auto_stopped"):
                 continue
             total_spent = float(
                 fan_data.get("total_spent") or fan_data.get("payment_total") or 0
@@ -2309,7 +2312,9 @@ Requirements:
 
 
 async def _check_unanswered_streak(account_id: str, fan_id: str) -> int:
-    """Count consecutive trailing outgoing messages with no fan reply."""
+    """Count consecutive trailing outgoing messages with no fan reply.
+    Returns the streak only when consecutive messages are ≥24h apart (separate sessions).
+    Returns 0 if the gap is under 24h — multiple messages sent in one session don't count."""
     try:
         msgs = await asyncio.wait_for(
             asyncio.to_thread(om_client.get_messages, account_id, fan_id, 20),
@@ -2317,12 +2322,27 @@ async def _check_unanswered_streak(account_id: str, fan_id: str) -> int:
         )
     except Exception:
         return 0
-    streak = 0
+
+    # Collect trailing outgoing messages (newest→oldest via reversed)
+    streak_msgs: list[dict] = []
     for m in reversed(msgs):
         if m.get("is_sent_by_me"):
-            streak += 1
+            streak_msgs.append(m)
         else:
             break
+
+    streak = len(streak_msgs)
+    if streak < 2:
+        return streak
+
+    # Require at least 24h between the oldest and newest outgoing message
+    times = [parse_dt(m.get("created_at")) for m in streak_msgs]
+    times = [t for t in times if t]
+    if len(times) >= 2:
+        gap_hours = (max(times) - min(times)).total_seconds() / 3600
+        if gap_hours < 24:
+            return 0  # all sent in the same session — no auto-stop
+
     return streak
 
 
@@ -2413,19 +2433,21 @@ async def _do_nd_send(
     except Exception as ex:
         logger.warning("nd_send: confirmation message failed: %s", ex)
 
-    # Auto-stop if 3 consecutive unanswered messages
+    # Auto-stop if 2 consecutive unanswered messages (each sent on a different day)
     streak = await _check_unanswered_streak(account_id, fan_id)
     logger.info("nd_send: unanswered streak for fan=%s: %d", fan_id, streak)
-    if streak >= 3:
+    if streak >= 2:
         fans = load_fans()
         if fan_id in fans:
-            fans[fan_id]["auto_stopped"] = True
+            fans[fan_id]["auto_stopped"]        = True
+            fans[fan_id]["auto_stopped_at"]     = datetime.now().isoformat()
+            fans[fan_id]["auto_stopped_streak"] = streak
             save_fans(fans)
             logger.info("nd_send: auto_stopped fan=%s (streak=%d)", fan_id, streak)
         try:
             await send_nightdrive_message(
                 app.bot,
-                f"⚠️ {dname} добавлен в стоп-лист: 3 сообщения подряд без ответа"
+                f"⚠️ {dname} добавлен в стоп-лист: {streak} сообщения подряд без ответа"
             )
         except Exception:
             pass
@@ -2744,11 +2766,18 @@ async def cmd_stoplist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not stopped:
         await update.message.reply_text("✅ Стоп-лист пуст")
         return
+    now   = datetime.now()
     lines = [f"🚫 Стоп-лист ({len(stopped)} фанов):\n"]
     for fid, fd in stopped:
-        name  = fan_display_name(fid, fd)
-        spent = float(fd.get("total_spent") or fd.get("payment_total") or 0)
-        lines.append(f"• {name} — ${spent:.0f}")
+        name    = fan_display_name(fid, fd)
+        spent   = float(fd.get("total_spent") or fd.get("payment_total") or 0)
+        streak  = int(fd.get("auto_stopped_streak") or 2)
+        last_dt = parse_dt(fd.get("last_message_date"))
+        days_silent = (now - last_dt).days if last_dt else "?"
+        lines.append(
+            f"• {name} — {streak} сообщ. без ответа • "
+            f"молчит {days_silent} дн • ${spent:.0f} всего"
+        )
     await update.message.reply_text("\n".join(lines))
 
 
@@ -3893,6 +3922,25 @@ async def _process_webhook(app: "Application", payload: dict) -> None:
         now         = datetime.now()
 
         if is_from_fan:
+            # Auto-restore from stop-list if fan writes on their own
+            if fan_data.get("auto_stopped"):
+                last_dt     = parse_dt(fan_data.get("last_message_date"))
+                days_silent = (now - last_dt).days if last_dt else 0
+                total       = float(fan_data.get("total_spent") or fan_data.get("payment_total") or 0)
+                dname_alert = _clean(fan_display_name(fan_id, fan_data))
+                fans[fan_id].pop("auto_stopped",        None)
+                fans[fan_id].pop("auto_stopped_at",     None)
+                fans[fan_id].pop("auto_stopped_streak", None)
+                save_fans(fans)
+                fan_data = fans[fan_id]
+                logger.info("Stoplist: fan %s returned by own message, removed auto_stopped", fan_id)
+                await send_alerts_message(
+                    app.bot,
+                    f"🔄 Вернулся из стоп-листа — {dname_alert}\n"
+                    f"💰 ${total:.0f} за всё время • Молчал {days_silent} дн\n"
+                    f"👤 /profile {fan_id}",
+                )
+
             # Level 1 — new fan
             if not fan_data:
                 await send_alerts_message(
@@ -3945,6 +3993,10 @@ async def _process_webhook(app: "Application", payload: dict) -> None:
 
     except Exception:
         logger.exception("_process_webhook error, payload: %s", payload)
+
+
+async def health_handler(request: web.Request) -> web.Response:
+    return web.Response(status=200, text="OK")
 
 
 async def webhook_handler(request: web.Request) -> web.Response:
@@ -4317,7 +4369,8 @@ async def cmd_webhook_status(update: Update, context: ContextTypes.DEFAULT_TYPE)
         lines.append("🔑 WEBHOOK_SECRET: не задан ⚠️")
 
     # 2. HTTP connectivity + 3. test request
-    url = "http://localhost:8080/webhook"
+    wh_port = int(os.environ.get("PORT", 8080))
+    url = f"http://localhost:{wh_port}/webhook"
     test_payload = json.dumps({"event": "status_check", "data": {}}).encode()
     try:
         async with _aiohttp.ClientSession() as session:
@@ -4328,7 +4381,7 @@ async def cmd_webhook_status(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 timeout=_aiohttp.ClientTimeout(total=5),
             ) as resp:
                 status = resp.status
-        lines.append("🌐 HTTP сервер 8080: отвечает ✅")
+        lines.append(f"🌐 HTTP сервер {wh_port}: отвечает ✅")
         if status == 200:
             lines.append(f"📨 Тест /webhook: {status} OK ✅")
         elif status == 401:
@@ -4336,10 +4389,10 @@ async def cmd_webhook_status(update: Update, context: ContextTypes.DEFAULT_TYPE)
         else:
             lines.append(f"📨 Тест /webhook: {status} ⚠️")
     except _aiohttp.ClientConnectorError:
-        lines.append("🌐 HTTP сервер 8080: не отвечает ❌")
+        lines.append(f"🌐 HTTP сервер {wh_port}: не отвечает ❌")
         lines.append("📨 Тест /webhook: недоступен ❌")
     except Exception as e:
-        lines.append(f"🌐 HTTP сервер 8080: ошибка — {e} ❌")
+        lines.append(f"🌐 HTTP сервер {wh_port}: ошибка — {e} ❌")
         lines.append("📨 Тест /webhook: недоступен ❌")
 
     # 4. Last 5 webhook-related log lines
@@ -4458,14 +4511,16 @@ async def run() -> None:
         SCHEDULE_HOUR_MSK, SCHEDULE_HOUR_MSK,
     )
 
-    # Start aiohttp webhook server on port 8080
+    # Start aiohttp webhook server — use $PORT if set (bothost.ru proxy), else 8080
+    wh_port = int(os.environ.get("PORT", 8080))
     wh_app = web.Application()
     wh_app["tg_app"] = app
+    wh_app.router.add_get("/health", health_handler)
     wh_app.router.add_post("/webhook", webhook_handler)
     runner = web.AppRunner(wh_app)
     await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", 8080).start()
-    logger.info("Webhook server listening on 0.0.0.0:8080")
+    await web.TCPSite(runner, "0.0.0.0", wh_port).start()
+    logger.info("Webhook server listening on 0.0.0.0:%d", wh_port)
 
     async with app:
         await app.start()
@@ -4475,7 +4530,7 @@ async def run() -> None:
         await asyncio.Event().wait()
 
 
-_PID_FILE = "/tmp/ofbot.pid"
+_PID_FILE = str(Path(os.environ.get("TMPDIR") or os.environ.get("TEMP") or "/tmp") / "ofbot.pid")
 
 
 def _acquire_pid_lock() -> None:
