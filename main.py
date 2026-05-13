@@ -27,12 +27,6 @@ from anthropic_client import AnthropicClient
 
 load_dotenv()
 
-# Удалить старый pid файл при старте
-try:
-    os.remove('/tmp/ofbot.pid')
-except:
-    pass
-
 # ─── CONSTANTS ────────────────────────────────────────────────────────────────
 DAYS_WITHOUT_PURCHASE_ALERT = 3
 DAYS_WITHOUT_REPLY_ALERT    = 2
@@ -4375,7 +4369,7 @@ async def cmd_webhook_status(update: Update, context: ContextTypes.DEFAULT_TYPE)
         lines.append("🔑 WEBHOOK_SECRET: не задан ⚠️")
 
     # 2. HTTP connectivity + 3. test request
-    wh_port = int(os.environ.get("PORT", 8080))
+    wh_port = int(os.environ.get("PORT", "8080"))
     url = f"http://localhost:{wh_port}/webhook"
     test_payload = json.dumps({"event": "status_check", "data": {}}).encode()
     try:
@@ -4517,23 +4511,27 @@ async def run() -> None:
         SCHEDULE_HOUR_MSK, SCHEDULE_HOUR_MSK,
     )
 
-    # Start aiohttp webhook server — use $PORT if set (bothost.ru proxy), else 8080
-    wh_port = int(os.environ.get("PORT", 8080))
-    wh_app = web.Application()
-    wh_app["tg_app"] = app
-    wh_app.router.add_get("/health", health_handler)
-    wh_app.router.add_post("/webhook", webhook_handler)
-    runner = web.AppRunner(wh_app)
-    await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", wh_port).start()
-    logger.info("Webhook server listening on 0.0.0.0:%d", wh_port)
-
-    async with app:
-        await app.start()
-        await app.updater.start_polling(drop_pending_updates=False, allowed_updates=Update.ALL_TYPES)
-        asyncio.create_task(scheduler_loop(app))
-        asyncio.create_task(_poll_unanswered_loop(app))
+    async def _run_http() -> None:
+        port = int(os.environ.get("PORT", "8080"))
+        wh_app = web.Application()
+        wh_app["tg_app"] = app
+        wh_app.router.add_get("/health", health_handler)
+        wh_app.router.add_post("/webhook", webhook_handler)
+        runner = web.AppRunner(wh_app)
+        await runner.setup()
+        await web.TCPSite(runner, "0.0.0.0", port).start()
+        logger.info("HTTP server listening on 0.0.0.0:%d", port)
         await asyncio.Event().wait()
+
+    async def _run_polling() -> None:
+        async with app:
+            await app.start()
+            await app.updater.start_polling(drop_pending_updates=False, allowed_updates=Update.ALL_TYPES)
+            asyncio.create_task(scheduler_loop(app))
+            asyncio.create_task(_poll_unanswered_loop(app))
+            await asyncio.Event().wait()
+
+    await asyncio.gather(_run_http(), _run_polling())
 
 
 if __name__ == "__main__":
