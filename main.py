@@ -11,8 +11,6 @@ import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from aiohttp import web
-
 import pytz
 
 from dotenv import load_dotenv
@@ -3763,18 +3761,10 @@ _unanswered: dict[str, datetime] = {}
 # fan_id → already alerted for this unanswered stretch (cleared on reply)
 _alerted_unanswered: set[str] = set()
 
-_wh_events_total: int = 0   # events received since start
-
 _HOT_WORDS = frozenset({
     "how much", "price", "cost", "buy", "want", "purchase",
     "how can i", "can i get",
 })
-
-
-def _wh_verify(raw_body: bytes, timestamp: str, signature: str, secret: str) -> bool:
-    msg = f"{timestamp}.{raw_body.decode('utf-8', errors='replace')}"
-    expected = hmac.new(secret.encode(), msg.encode(), hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, signature)
 
 
 def _wh_extract(payload: dict) -> tuple[str, str, dict]:
@@ -3993,33 +3983,6 @@ async def _process_webhook(app: "Application", payload: dict) -> None:
 
     except Exception:
         logger.exception("_process_webhook error, payload: %s", payload)
-
-
-async def health_handler(request: web.Request) -> web.Response:
-    return web.Response(status=200, text="healthy")
-
-
-async def webhook_handler(request: web.Request) -> web.Response:
-    raw = await request.read()
-    secret = os.getenv("WEBHOOK_SECRET", "")
-    if secret and secret != "СЮДА_ВСТАВИШЬ_СЕКРЕТ":
-        sig = request.headers.get("x-om-webhook-signature", "")
-        ts  = request.headers.get("x-om-webhook-timestamp", "")
-        if not sig or not _wh_verify(raw, ts, sig, secret):
-            logger.warning("Webhook: bad signature from %s", request.remote)
-            return web.Response(status=401, text="Unauthorized")
-
-    try:
-        payload = json.loads(raw)
-    except Exception:
-        return web.Response(status=400, text="Bad JSON")
-
-    global _wh_events_total
-    _wh_events_total += 1
-
-    app = request.app["tg_app"]
-    asyncio.create_task(_process_webhook(app, payload))
-    return web.Response(status=200, text="OK")
 
 
 async def _poll_unanswered_loop(app: "Application") -> None:
@@ -4408,7 +4371,8 @@ async def cmd_webhook_status(update: Update, context: ContextTypes.DEFAULT_TYPE)
         lines.append(f"\n📋 Лог: не удалось прочитать — {e}")
 
     # 5. Events counter
-    lines.append(f"\n📊 Webhook событий с запуска: <b>{_wh_events_total}</b>")
+    import webhook_server as _whs
+    lines.append(f"\n📊 Webhook событий с запуска: <b>{_whs.get_events_total()}</b>")
 
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
@@ -4511,27 +4475,27 @@ async def run() -> None:
         SCHEDULE_HOUR_MSK, SCHEDULE_HOUR_MSK,
     )
 
-    async def _run_http() -> None:
-        port = int(os.environ.get("PORT", "3000"))
-        wh_app = web.Application()
-        wh_app["tg_app"] = app
-        wh_app.router.add_get("/health", health_handler)
-        wh_app.router.add_post("/webhook", webhook_handler)
-        runner = web.AppRunner(wh_app)
-        await runner.setup()
-        await web.TCPSite(runner, "0.0.0.0", port).start()
-        logger.info("HTTP server listening on 0.0.0.0:%d", port)
+    import threading
+    import uvicorn
+    import webhook_server
+
+    loop = asyncio.get_event_loop()
+    webhook_server.init(app, loop, _process_webhook)
+
+    port = int(os.environ.get("PORT", "3000"))
+
+    def _start_fastapi() -> None:
+        uvicorn.run(webhook_server.app_http, host="0.0.0.0", port=port, log_level="warning")
+
+    threading.Thread(target=_start_fastapi, daemon=True).start()
+    logger.info("FastAPI webhook server starting on 0.0.0.0:%d", port)
+
+    async with app:
+        await app.start()
+        await app.updater.start_polling(drop_pending_updates=False, allowed_updates=Update.ALL_TYPES)
+        asyncio.create_task(scheduler_loop(app))
+        asyncio.create_task(_poll_unanswered_loop(app))
         await asyncio.Event().wait()
-
-    async def _run_polling() -> None:
-        async with app:
-            await app.start()
-            await app.updater.start_polling(drop_pending_updates=False, allowed_updates=Update.ALL_TYPES)
-            asyncio.create_task(scheduler_loop(app))
-            asyncio.create_task(_poll_unanswered_loop(app))
-            await asyncio.Event().wait()
-
-    await asyncio.gather(_run_http(), _run_polling())
 
 
 if __name__ == "__main__":
