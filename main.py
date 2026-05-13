@@ -4369,7 +4369,7 @@ async def cmd_webhook_status(update: Update, context: ContextTypes.DEFAULT_TYPE)
         lines.append("🔑 WEBHOOK_SECRET: не задан ⚠️")
 
     # 2. HTTP connectivity + 3. test request
-    wh_port = int(os.environ.get("PORT", "8080"))
+    wh_port = int(os.environ.get("PORT", "3000"))
     url = f"http://localhost:{wh_port}/webhook"
     test_payload = json.dumps({"event": "status_check", "data": {}}).encode()
     try:
@@ -4512,7 +4512,7 @@ async def run() -> None:
     )
 
     async def _run_http() -> None:
-        port = int(os.environ.get("PORT", "8080"))
+        port = int(os.environ.get("PORT", "3000"))
         wh_app = web.Application()
         wh_app["tg_app"] = app
         wh_app.router.add_get("/health", health_handler)
