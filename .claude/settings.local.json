@@ -20,7 +20,9 @@
       "Bash(xargs -r kill -9)",
       "Bash(taskkill //F //PID 306)",
       "Bash(pip show *)",
-      "Bash(pip3 show *)"
+      "Bash(pip3 show *)",
+      "PowerShell(pip list *)",
+      "PowerShell(pip install *)"
     ]
   }
 }
